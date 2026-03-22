@@ -42,7 +42,9 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
+import androidx.media3.common.TrackGroup
 import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.util.Util
 import androidx.media3.datasource.DataSource
@@ -318,9 +320,7 @@ internal class BetterPlayer(
         val type: Int
         if (formatHint == null) {
             var lastPathSegment = uri?.lastPathSegment
-            if (lastPathSegment == null) {
-                lastPathSegment = ""
-            }
+            if (lastPathSegment == null) lastPathSegment = ""
             type = Util.inferContentTypeForExtension(lastPathSegment.split(".")[1])
         } else {
             type = when (formatHint) {
@@ -333,41 +333,29 @@ internal class BetterPlayer(
         }
         val mediaItemBuilder = MediaItem.Builder()
         mediaItemBuilder.setUri(uri)
-        if (!cacheKey.isNullOrEmpty()) {
-            mediaItemBuilder.setCustomCacheKey(cacheKey)
-        }
+        if (!cacheKey.isNullOrEmpty()) mediaItemBuilder.setCustomCacheKey(cacheKey)
         val mediaItem = mediaItemBuilder.build()
         val drmSessionManagerProvider: DrmSessionManagerProvider? = drmSessionManager?.let { manager ->
             DrmSessionManagerProvider { manager }
         }
-
         return when (type) {
             C.CONTENT_TYPE_SS -> SsMediaSource.Factory(
                 DefaultSsChunkSource.Factory(mediaDataSourceFactory),
                 DefaultDataSource.Factory(context, mediaDataSourceFactory)
-            ).apply {
-                if (drmSessionManagerProvider != null) setDrmSessionManagerProvider(drmSessionManagerProvider)
-            }.createMediaSource(mediaItem)
-
+            ).apply { if (drmSessionManagerProvider != null) setDrmSessionManagerProvider(drmSessionManagerProvider) }
+              .createMediaSource(mediaItem)
             C.CONTENT_TYPE_DASH -> DashMediaSource.Factory(
                 DefaultDashChunkSource.Factory(mediaDataSourceFactory),
                 DefaultDataSource.Factory(context, mediaDataSourceFactory)
-            ).apply {
-                if (drmSessionManagerProvider != null) setDrmSessionManagerProvider(drmSessionManagerProvider)
-            }.createMediaSource(mediaItem)
-
+            ).apply { if (drmSessionManagerProvider != null) setDrmSessionManagerProvider(drmSessionManagerProvider) }
+              .createMediaSource(mediaItem)
             C.CONTENT_TYPE_HLS -> HlsMediaSource.Factory(mediaDataSourceFactory)
-                .apply {
-                    if (drmSessionManagerProvider != null) setDrmSessionManagerProvider(drmSessionManagerProvider)
-                }.createMediaSource(mediaItem)
-
+                .apply { if (drmSessionManagerProvider != null) setDrmSessionManagerProvider(drmSessionManagerProvider) }
+                .createMediaSource(mediaItem)
             C.CONTENT_TYPE_OTHER -> ProgressiveMediaSource.Factory(
-                mediaDataSourceFactory,
-                DefaultExtractorsFactory()
-            ).apply {
-                if (drmSessionManagerProvider != null) setDrmSessionManagerProvider(drmSessionManagerProvider)
-            }.createMediaSource(mediaItem)
-
+                mediaDataSourceFactory, DefaultExtractorsFactory()
+            ).apply { if (drmSessionManagerProvider != null) setDrmSessionManagerProvider(drmSessionManagerProvider) }
+              .createMediaSource(mediaItem)
             else -> throw IllegalStateException("Unsupported type: $type")
         }
     }
@@ -531,56 +519,187 @@ internal class BetterPlayer(
         mediaSession = null
     }
 
+    // ── Audio track selection ─────────────────────────────────────────────────
+    //
+    // Root cause of the "shows English, plays Russian" bug:
+    //   The old approach used mappedTrackInfo (from DefaultTrackSelector) to get
+    //   TrackGroup references, then passed those to TrackSelectionOverride.
+    //   mappedTrackInfo is a snapshot — the TrackGroup objects it returns are
+    //   renderer-specific wrappers that can become stale after buffering or seek.
+    //   ExoPlayer silently ignores overrides that reference stale group objects.
+    //
+    // Fix:
+    //   Use exoPlayer.currentTracks (the live track list from Media3) to get
+    //   the canonical TrackGroup reference that ExoPlayer actually knows about.
+    //   This reference stays valid for the lifetime of the current media item.
+    //
+    // Matching priority:
+    //   Pass 1 — exact language code match  (e.g. format.language == "en")
+    //   Pass 2 — label match                (e.g. format.label == "English")
+    //   Pass 3 — index fallback             (use the nth audio group by index)
+    //
+    // We also set preferredAudioLanguage on trackSelector.parameters so that
+    // ExoPlayer's own adaptive logic respects the choice across seeks/rebuffers.
+
     fun setAudioTrack(name: String, index: Int) {
+        val player = exoPlayer ?: return
+        try {
+            // Dump all available audio tracks to logcat for debugging
+            val currentTracks = player.currentTracks
+            val audioGroups = currentTracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+            Log.d(TAG, "setAudioTrack called: name='$name' index=$index")
+            Log.d(TAG, "Available audio groups: ${audioGroups.size}")
+            audioGroups.forEachIndexed { gi, group ->
+                for (ti in 0 until group.length) {
+                    val fmt = group.getTrackFormat(ti)
+                    Log.d(TAG, "  group[$gi] track[$ti] lang='${fmt.language}' label='${fmt.label}' id='${fmt.id}'")
+                }
+            }
+
+            if (audioGroups.isEmpty()) {
+                Log.w(TAG, "setAudioTrack: no audio groups in currentTracks — will retry via mappedTrackInfo")
+                setAudioTrackLegacy(name, index)
+                return
+            }
+
+            // Pass 1: exact language code match
+            for (group in audioGroups) {
+                for (ti in 0 until group.length) {
+                    val fmt = group.getTrackFormat(ti)
+                    if (fmt.language != null && (fmt.language == name || fmt.language == normalizeLanguage(name))) {
+                        Log.d(TAG, "setAudioTrack: Pass1 lang match lang='${fmt.language}' group=${group.mediaTrackGroup}")
+                        applyAudioOverride(group.mediaTrackGroup, ti, fmt.language)
+                        return
+                    }
+                }
+            }
+
+            // Pass 2: label match
+            for (group in audioGroups) {
+                for (ti in 0 until group.length) {
+                    val fmt = group.getTrackFormat(ti)
+                    if (fmt.label != null && fmt.label == name) {
+                        Log.d(TAG, "setAudioTrack: Pass2 label match label='${fmt.label}' group=${group.mediaTrackGroup}")
+                        applyAudioOverride(group.mediaTrackGroup, ti, fmt.language)
+                        return
+                    }
+                }
+            }
+
+            // Pass 3: index fallback
+            if (index >= 0 && index < audioGroups.size) {
+                val group = audioGroups[index]
+                val fmt = group.getTrackFormat(0)
+                Log.d(TAG, "setAudioTrack: Pass3 index fallback index=$index lang='${fmt.language}' group=${group.mediaTrackGroup}")
+                applyAudioOverride(group.mediaTrackGroup, 0, fmt.language)
+                return
+            }
+
+            Log.w(TAG, "setAudioTrack: no match found for name='$name' index=$index")
+        } catch (e: Exception) {
+            Log.e(TAG, "setAudioTrack failed: $e")
+        }
+    }
+
+    private fun applyAudioOverride(trackGroup: TrackGroup, trackIndex: Int, language: String?) {
+        val safeIndex = trackIndex.coerceIn(0, trackGroup.length - 1)
+        // Set both the override AND the preferred language — the preferred language
+        // setting ensures ExoPlayer's adaptive logic keeps the right track across
+        // seeks and rebuffers even if the override is re-evaluated.
+        val builder = trackSelector.parameters.buildUpon()
+            .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+            .addOverride(TrackSelectionOverride(trackGroup, safeIndex))
+        if (!language.isNullOrEmpty()) {
+            builder.setPreferredAudioLanguage(language)
+        }
+        trackSelector.setParameters(builder)
+        Log.d(TAG, "applyAudioOverride: applied override for group=${trackGroup} track=$safeIndex lang=$language")
+    }
+
+    // Legacy fallback using mappedTrackInfo — used when currentTracks has no audio groups yet
+    // (e.g. called before the player has started rendering).
+    private fun setAudioTrackLegacy(name: String, index: Int) {
         try {
             val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
             for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
                 if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) continue
                 val trackGroupArray = mappedTrackInfo.getTrackGroups(rendererIndex)
-                // Pass 1: match by label or language code
+                Log.d(TAG, "setAudioTrackLegacy: rendererIndex=$rendererIndex groups=${trackGroupArray.length}")
+                // Pass 1: language/label match
                 for (groupIndex in 0 until trackGroupArray.length) {
                     val group = trackGroupArray[groupIndex]
-                    for (trackIndex in 0 until group.length) {
-                        val format = group.getFormat(trackIndex)
-                        if (name == format.label || name == format.language) {
-                            setAudioTrack(rendererIndex, groupIndex, trackIndex)
+                    for (trackIndex2 in 0 until group.length) {
+                        val format = group.getFormat(trackIndex2)
+                        Log.d(TAG, "  legacy group[$groupIndex] track[$trackIndex2] lang='${format.language}' label='${format.label}'")
+                        if (name == format.language || name == format.label ||
+                            name == normalizeLanguage(format.language ?: "")) {
+                            Log.d(TAG, "setAudioTrackLegacy: match at group=$groupIndex track=$trackIndex2")
+                            applyAudioOverrideLegacy(rendererIndex, groupIndex, trackIndex2)
                             return
                         }
                     }
                 }
-                // Pass 2: fallback - use group index directly when labels are missing
+                // Pass 2: index fallback
                 if (index >= 0 && index < trackGroupArray.length) {
-                    val group = trackGroupArray[index]
-                    if (group.length > 0) {
-                        setAudioTrack(rendererIndex, index, 0)
-                        return
-                    }
+                    Log.d(TAG, "setAudioTrackLegacy: index fallback at $index")
+                    applyAudioOverrideLegacy(rendererIndex, index, 0)
+                    return
                 }
             }
-        } catch (exception: Exception) {
-            Log.e(TAG, "setAudioTrack failed: $exception")
+        } catch (e: Exception) {
+            Log.e(TAG, "setAudioTrackLegacy failed: $e")
         }
     }
 
-    private fun setAudioTrack(rendererIndex: Int, groupIndex: Int, trackIndex: Int) {
+    private fun applyAudioOverrideLegacy(rendererIndex: Int, groupIndex: Int, trackIndex: Int) {
         val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
         val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
-        if (groupIndex < 0 || groupIndex >= trackGroups.length) {
-            Log.e(TAG, "setAudioTrack: groupIndex out of bounds: $groupIndex")
-            return
-        }
+        if (groupIndex < 0 || groupIndex >= trackGroups.length) return
         val group = trackGroups.get(groupIndex)
-        val safeTrackIndex = trackIndex.coerceIn(0, group.length - 1)
-
-        // Clear ALL existing audio overrides first so switching back to a
-        // previously-selected track works correctly. Without this, addOverride
-        // stacks on top of the old override and ExoPlayer keeps the old one.
+        val safeIndex = trackIndex.coerceIn(0, group.length - 1)
         trackSelector.setParameters(
             trackSelector.parameters.buildUpon()
                 .setRendererDisabled(rendererIndex, false)
                 .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
-                .addOverride(TrackSelectionOverride(group, safeTrackIndex))
+                .addOverride(TrackSelectionOverride(group, safeIndex))
         )
+    }
+
+    // Normalize ISO 639-1 ↔ 639-2 codes so 'en' matches 'eng' and vice versa
+    private fun normalizeLanguage(code: String): String {
+        return when (code.lowercase()) {
+            "eng" -> "en"
+            "ara" -> "ar"
+            "fra", "fre" -> "fr"
+            "deu", "ger" -> "de"
+            "spa" -> "es"
+            "ita" -> "it"
+            "por" -> "pt"
+            "jpn" -> "ja"
+            "kor" -> "ko"
+            "zho", "chi" -> "zh"
+            "tur" -> "tr"
+            "hin" -> "hi"
+            "rus" -> "ru"
+            "nld", "dut" -> "nl"
+            "pol" -> "pl"
+            "en" -> "eng"
+            "ar" -> "ara"
+            "fr" -> "fra"
+            "de" -> "deu"
+            "es" -> "spa"
+            "it" -> "ita"
+            "pt" -> "por"
+            "ja" -> "jpn"
+            "ko" -> "kor"
+            "zh" -> "zho"
+            "tr" -> "tur"
+            "hi" -> "hin"
+            "ru" -> "rus"
+            "nl" -> "nld"
+            "pl" -> "pol"
+            else -> code
+        }
     }
 
     private fun sendSeekToEvent(positionMs: Long) {
