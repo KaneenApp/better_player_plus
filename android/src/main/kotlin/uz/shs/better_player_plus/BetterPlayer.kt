@@ -519,55 +519,105 @@ internal class BetterPlayer(
         mediaSession = null
     }
 
-    // ── Audio track selection ─────────────────────────────────────────────────
+    // ── Audio track selection ────────────────────────────────────────────────
     //
-    // Root cause of the "shows English, plays Russian" bug:
-    //   The old approach used mappedTrackInfo (from DefaultTrackSelector) to get
-    //   TrackGroup references, then passed those to TrackSelectionOverride.
-    //   mappedTrackInfo is a snapshot — the TrackGroup objects it returns are
-    //   renderer-specific wrappers that can become stale after buffering or seek.
-    //   ExoPlayer silently ignores overrides that reference stale group objects.
+    // Dart sends `name` which can be any of:
+    //   - ISO 639-1 code:  'en', 'es', 'ru'
+    //   - ISO 639-2 code:  'eng', 'spa', 'rus'
+    //   - Human label:     'English', 'Spanish', 'Russian'
     //
-    // Fix:
-    //   Use exoPlayer.currentTracks (the live track list from Media3) to get
-    //   the canonical TrackGroup reference that ExoPlayer actually knows about.
-    //   This reference stays valid for the lifetime of the current media item.
+    // ExoPlayer stores language as ISO 639-1 or 639-2 (file-dependent),
+    // with label typically null for MKV embedded tracks.
     //
-    // Matching priority:
-    //   Pass 1 — exact language code match  (e.g. format.language == "en")
-    //   Pass 2 — label match                (e.g. format.label == "English")
-    //   Pass 3 — index fallback             (use the nth audio group by index)
+    // Dart also sends `index` = raw container track position (probed.index).
     //
-    // We also set preferredAudioLanguage on trackSelector.parameters so that
-    // ExoPlayer's own adaptive logic respects the choice across seeks/rebuffers.
+    // Match priority:
+    //   Pass 1 — language code match: compare name (and all its equivalents)
+    //             against fmt.language (and its equivalents)
+    //   Pass 2 — label match: compare name against fmt.label
+    //   Pass 3 — index fallback: use the nth audio group by container index
+
+    // Human-readable label → ISO 639-1 lookup
+    private val labelToIso = mapOf(
+        "english" to "en", "arabic" to "ar", "french" to "fr",
+        "german" to "de", "spanish" to "es", "italian" to "it",
+        "portuguese" to "pt", "japanese" to "ja", "korean" to "ko",
+        "chinese" to "zh", "turkish" to "tr", "hindi" to "hi",
+        "russian" to "ru", "dutch" to "nl", "polish" to "pl",
+        "swedish" to "sv", "ukrainian" to "uk", "hebrew" to "he",
+        "persian" to "fa", "thai" to "th", "indonesian" to "id",
+        "malay" to "ms", "czech" to "cs", "hungarian" to "hu",
+        "romanian" to "ro", "norwegian" to "no", "danish" to "da",
+        "finnish" to "fi"
+    )
+
+    // Returns all ISO forms of a given code/label so we can match any variant
+    private fun isoVariants(input: String): Set<String> {
+        val lower = input.lowercase().trim()
+        val set = mutableSetOf(lower)
+        // If it's a human label, convert to ISO-1
+        labelToIso[lower]?.let { set.add(it) }
+        // ISO-1 → ISO-2
+        val iso2to3 = mapOf(
+            "en" to "eng", "ar" to "ara", "fr" to "fra", "de" to "deu",
+            "es" to "spa", "it" to "ita", "pt" to "por", "ja" to "jpn",
+            "ko" to "kor", "zh" to "zho", "tr" to "tur", "hi" to "hin",
+            "ru" to "rus", "nl" to "nld", "pl" to "pol", "sv" to "swe",
+            "uk" to "ukr", "he" to "heb", "fa" to "fas", "th" to "tha",
+            "id" to "ind", "ms" to "msa", "cs" to "ces", "hu" to "hun",
+            "ro" to "ron", "no" to "nor", "da" to "dan", "fi" to "fin"
+        )
+        val iso3to2 = iso2to3.entries.associate { (k, v) -> v to k }.toMutableMap()
+        // Extra aliases
+        iso3to2["fre"] = "fr"; iso3to2["ger"] = "de"; iso3to2["chi"] = "zh"
+        iso3to2["dut"] = "nl"; iso3to2["cze"] = "cs"; iso3to2["per"] = "fa"
+        iso3to2["mac"] = "mk"; iso3to2["rum"] = "ro"
+
+        // Expand whatever we have to all variants
+        val current = set.toList()
+        for (code in current) {
+            iso2to3[code]?.let { set.add(it) }
+            iso3to2[code]?.let { set.add(it) }
+            // Also try via label path
+            labelToIso[code]?.let { iso1 ->
+                set.add(iso1)
+                iso2to3[iso1]?.let { set.add(it) }
+            }
+        }
+        return set
+    }
 
     fun setAudioTrack(name: String, index: Int) {
         val player = exoPlayer ?: return
         try {
-            // Dump all available audio tracks to logcat for debugging
             val currentTracks = player.currentTracks
             val audioGroups = currentTracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
-            Log.d(TAG, "setAudioTrack called: name='$name' index=$index")
-            Log.d(TAG, "Available audio groups: ${audioGroups.size}")
+
+            Log.d(TAG, "setAudioTrack: name='$name' index=$index | groups=${audioGroups.size}")
             audioGroups.forEachIndexed { gi, group ->
                 for (ti in 0 until group.length) {
                     val fmt = group.getTrackFormat(ti)
-                    Log.d(TAG, "  group[$gi] track[$ti] lang='${fmt.language}' label='${fmt.label}' id='${fmt.id}'")
+                    Log.d(TAG, "  [$gi][$ti] lang='${fmt.language}' label='${fmt.label}' id='${fmt.id}'")
                 }
             }
 
             if (audioGroups.isEmpty()) {
-                Log.w(TAG, "setAudioTrack: no audio groups in currentTracks — will retry via mappedTrackInfo")
+                Log.w(TAG, "setAudioTrack: no audio in currentTracks, trying legacy")
                 setAudioTrackLegacy(name, index)
                 return
             }
 
-            // Pass 1: exact language code match
+            // Build the set of ISO variants we're looking for
+            val wantVariants = isoVariants(name)
+            Log.d(TAG, "setAudioTrack: looking for variants=$wantVariants")
+
+            // Pass 1: language code match (any ISO variant)
             for (group in audioGroups) {
                 for (ti in 0 until group.length) {
                     val fmt = group.getTrackFormat(ti)
-                    if (fmt.language != null && (fmt.language == name || fmt.language == normalizeLanguage(name))) {
-                        Log.d(TAG, "setAudioTrack: Pass1 lang match lang='${fmt.language}' group=${group.mediaTrackGroup}")
+                    val fmtVariants = if (fmt.language != null) isoVariants(fmt.language!!) else emptySet()
+                    if (wantVariants.intersect(fmtVariants).isNotEmpty()) {
+                        Log.d(TAG, "setAudioTrack: Pass1 lang match lang='${fmt.language}' wantVariants=$wantVariants")
                         applyAudioOverride(group.mediaTrackGroup, ti, fmt.language)
                         return
                     }
@@ -578,24 +628,26 @@ internal class BetterPlayer(
             for (group in audioGroups) {
                 for (ti in 0 until group.length) {
                     val fmt = group.getTrackFormat(ti)
-                    if (fmt.label != null && fmt.label == name) {
-                        Log.d(TAG, "setAudioTrack: Pass2 label match label='${fmt.label}' group=${group.mediaTrackGroup}")
+                    if (fmt.label != null && fmt.label!!.lowercase() == name.lowercase()) {
+                        Log.d(TAG, "setAudioTrack: Pass2 label match label='${fmt.label}'")
                         applyAudioOverride(group.mediaTrackGroup, ti, fmt.language)
                         return
                     }
                 }
             }
 
-            // Pass 3: index fallback
+            // Pass 3: raw container index fallback
+            // `index` is probed.index from Dart — the MKV container track position.
+            // audioGroups are in container order, so index maps directly.
             if (index >= 0 && index < audioGroups.size) {
                 val group = audioGroups[index]
                 val fmt = group.getTrackFormat(0)
-                Log.d(TAG, "setAudioTrack: Pass3 index fallback index=$index lang='${fmt.language}' group=${group.mediaTrackGroup}")
+                Log.d(TAG, "setAudioTrack: Pass3 index=$index lang='${fmt.language}'")
                 applyAudioOverride(group.mediaTrackGroup, 0, fmt.language)
                 return
             }
 
-            Log.w(TAG, "setAudioTrack: no match found for name='$name' index=$index")
+            Log.w(TAG, "setAudioTrack: no match for name='$name' index=$index")
         } catch (e: Exception) {
             Log.e(TAG, "setAudioTrack failed: $e")
         }
@@ -603,102 +655,57 @@ internal class BetterPlayer(
 
     private fun applyAudioOverride(trackGroup: TrackGroup, trackIndex: Int, language: String?) {
         val safeIndex = trackIndex.coerceIn(0, trackGroup.length - 1)
-        // Set both the override AND the preferred language — the preferred language
-        // setting ensures ExoPlayer's adaptive logic keeps the right track across
-        // seeks and rebuffers even if the override is re-evaluated.
         val builder = trackSelector.parameters.buildUpon()
             .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
             .addOverride(TrackSelectionOverride(trackGroup, safeIndex))
         if (!language.isNullOrEmpty()) {
-            builder.setPreferredAudioLanguage(language)
+            // Also set preferredAudioLanguage so adaptive logic survives seeks
+            val iso1 = isoVariants(language).firstOrNull { it.length == 2 } ?: language
+            builder.setPreferredAudioLanguage(iso1)
         }
         trackSelector.setParameters(builder)
-        Log.d(TAG, "applyAudioOverride: applied override for group=${trackGroup} track=$safeIndex lang=$language")
+        Log.d(TAG, "applyAudioOverride: group=${trackGroup} track=$safeIndex lang=$language")
     }
 
-    // Legacy fallback using mappedTrackInfo — used when currentTracks has no audio groups yet
-    // (e.g. called before the player has started rendering).
     private fun setAudioTrackLegacy(name: String, index: Int) {
         try {
             val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
+            val wantVariants = isoVariants(name)
             for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
                 if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) continue
                 val trackGroupArray = mappedTrackInfo.getTrackGroups(rendererIndex)
-                Log.d(TAG, "setAudioTrackLegacy: rendererIndex=$rendererIndex groups=${trackGroupArray.length}")
-                // Pass 1: language/label match
                 for (groupIndex in 0 until trackGroupArray.length) {
                     val group = trackGroupArray[groupIndex]
-                    for (trackIndex2 in 0 until group.length) {
-                        val format = group.getFormat(trackIndex2)
-                        Log.d(TAG, "  legacy group[$groupIndex] track[$trackIndex2] lang='${format.language}' label='${format.label}'")
-                        if (name == format.language || name == format.label ||
-                            name == normalizeLanguage(format.language ?: "")) {
-                            Log.d(TAG, "setAudioTrackLegacy: match at group=$groupIndex track=$trackIndex2")
-                            applyAudioOverrideLegacy(rendererIndex, groupIndex, trackIndex2)
+                    for (ti in 0 until group.length) {
+                        val fmt = group.getFormat(ti)
+                        val fmtVariants = if (fmt.language != null) isoVariants(fmt.language!!) else emptySet()
+                        if (wantVariants.intersect(fmtVariants).isNotEmpty() ||
+                            (fmt.label != null && fmt.label!!.lowercase() == name.lowercase())) {
+                            Log.d(TAG, "setAudioTrackLegacy: match group=$groupIndex track=$ti")
+                            val safeIndex = ti.coerceIn(0, group.length - 1)
+                            trackSelector.setParameters(
+                                trackSelector.parameters.buildUpon()
+                                    .setRendererDisabled(rendererIndex, false)
+                                    .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                                    .addOverride(TrackSelectionOverride(group, safeIndex))
+                            )
                             return
                         }
                     }
                 }
-                // Pass 2: index fallback
                 if (index >= 0 && index < trackGroupArray.length) {
-                    Log.d(TAG, "setAudioTrackLegacy: index fallback at $index")
-                    applyAudioOverrideLegacy(rendererIndex, index, 0)
+                    val group = trackGroupArray[index]
+                    trackSelector.setParameters(
+                        trackSelector.parameters.buildUpon()
+                            .setRendererDisabled(rendererIndex, false)
+                            .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                            .addOverride(TrackSelectionOverride(group, 0))
+                    )
                     return
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "setAudioTrackLegacy failed: $e")
-        }
-    }
-
-    private fun applyAudioOverrideLegacy(rendererIndex: Int, groupIndex: Int, trackIndex: Int) {
-        val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
-        val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
-        if (groupIndex < 0 || groupIndex >= trackGroups.length) return
-        val group = trackGroups.get(groupIndex)
-        val safeIndex = trackIndex.coerceIn(0, group.length - 1)
-        trackSelector.setParameters(
-            trackSelector.parameters.buildUpon()
-                .setRendererDisabled(rendererIndex, false)
-                .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
-                .addOverride(TrackSelectionOverride(group, safeIndex))
-        )
-    }
-
-    // Normalize ISO 639-1 ↔ 639-2 codes so 'en' matches 'eng' and vice versa
-    private fun normalizeLanguage(code: String): String {
-        return when (code.lowercase()) {
-            "eng" -> "en"
-            "ara" -> "ar"
-            "fra", "fre" -> "fr"
-            "deu", "ger" -> "de"
-            "spa" -> "es"
-            "ita" -> "it"
-            "por" -> "pt"
-            "jpn" -> "ja"
-            "kor" -> "ko"
-            "zho", "chi" -> "zh"
-            "tur" -> "tr"
-            "hin" -> "hi"
-            "rus" -> "ru"
-            "nld", "dut" -> "nl"
-            "pol" -> "pl"
-            "en" -> "eng"
-            "ar" -> "ara"
-            "fr" -> "fra"
-            "de" -> "deu"
-            "es" -> "spa"
-            "it" -> "ita"
-            "pt" -> "por"
-            "ja" -> "jpn"
-            "ko" -> "kor"
-            "zh" -> "zho"
-            "tr" -> "tur"
-            "hi" -> "hin"
-            "ru" -> "rus"
-            "nl" -> "nld"
-            "pl" -> "pol"
-            else -> code
         }
     }
 
