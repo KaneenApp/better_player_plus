@@ -337,7 +337,6 @@ internal class BetterPlayer(
             mediaItemBuilder.setCustomCacheKey(cacheKey)
         }
         val mediaItem = mediaItemBuilder.build()
-        // Explicit type on the provider to avoid Kotlin inferring MediaItem instead of DrmSessionManager
         val drmSessionManagerProvider: DrmSessionManagerProvider? = drmSessionManager?.let { manager ->
             DrmSessionManagerProvider { manager }
         }
@@ -532,15 +531,6 @@ internal class BetterPlayer(
         mediaSession = null
     }
 
-    // FIX: The original implementation required name AND groupIndex to match
-    // simultaneously. For MKV/MP4 embedded audio tracks, labels are often null
-    // or don't match the string sent from Dart, so the exact match always failed.
-    // The fallback then hardcoded trackIndex=0, meaning the first track (e.g. Russian)
-    // always played regardless of what the user selected.
-    //
-    // New approach:
-    //   Pass 1 - match by label or language code (reliable for named tracks)
-    //   Pass 2 - fallback to pure group index (for unlabelled tracks)
     fun setAudioTrack(name: String, index: Int) {
         try {
             val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
@@ -581,9 +571,14 @@ internal class BetterPlayer(
         }
         val group = trackGroups.get(groupIndex)
         val safeTrackIndex = trackIndex.coerceIn(0, group.length - 1)
+
+        // Clear ALL existing audio overrides first so switching back to a
+        // previously-selected track works correctly. Without this, addOverride
+        // stacks on top of the old override and ExoPlayer keeps the old one.
         trackSelector.setParameters(
             trackSelector.parameters.buildUpon()
                 .setRendererDisabled(rendererIndex, false)
+                .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
                 .addOverride(TrackSelectionOverride(group, safeTrackIndex))
         )
     }
