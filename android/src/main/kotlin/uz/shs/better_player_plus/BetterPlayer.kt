@@ -637,8 +637,6 @@ internal class BetterPlayer(
                 }
             })
             mediaSession.isActive = true
-//            val mediaSessionConnector = MediaSessionConnector(mediaSession)
-//            mediaSessionConnector.setPlayer(exoPlayer)
             this.mediaSession = mediaSession
             return mediaSession
         }
@@ -659,57 +657,41 @@ internal class BetterPlayer(
         mediaSession = null
     }
 
+    // Fixed: original logic required name AND index to match simultaneously, causing
+    // the fallback to always pick track 0 (e.g. Russian) regardless of user selection.
+    // Now: match by label or language first, then fall back to pure index-based selection.
     fun setAudioTrack(name: String, index: Int) {
         try {
-            val mappedTrackInfo = trackSelector.currentMappedTrackInfo
-            if (mappedTrackInfo != null) {
-                for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
-                    if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) {
-                        continue
-                    }
-                    val trackGroupArray = mappedTrackInfo.getTrackGroups(rendererIndex)
-                    var hasElementWithoutLabel = false
-                    var hasStrangeAudioTrack = false
-                    for (groupIndex in 0 until trackGroupArray.length) {
-                        val group = trackGroupArray[groupIndex]
-                        for (groupElementIndex in 0 until group.length) {
-                            val format = group.getFormat(groupElementIndex)
-                            if (format.label == null) {
-                                hasElementWithoutLabel = true
-                            }
-                            if (format.id != null && format.id == "1/15") {
-                                hasStrangeAudioTrack = true
-                            }
-                        }
-                    }
-                    for (groupIndex in 0 until trackGroupArray.length) {
-                        val group = trackGroupArray[groupIndex]
-                        for (groupElementIndex in 0 until group.length) {
-                            val label = group.getFormat(groupElementIndex).label
-                            // Exact match by label and provided group index
-                            if (name == label && index == groupIndex) {
-                                setAudioTrack(rendererIndex, groupIndex, groupElementIndex)
-                                return
-                            }
+            val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
 
-                            ///Fallback option
-                            if (!hasStrangeAudioTrack && hasElementWithoutLabel && index == groupIndex) {
-                                // When labels are missing, default to the first track within the group
-                                val safeTrackIndex = if (group.length > 0) 0 else groupElementIndex
-                                setAudioTrack(rendererIndex, groupIndex, safeTrackIndex)
-                                return
-                            }
-                            ///Fallback option
-                            if (hasStrangeAudioTrack && name == label) {
-                                setAudioTrack(rendererIndex, groupIndex, groupElementIndex)
-                                return
-                            }
+            for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
+                if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) continue
+
+                val trackGroupArray = mappedTrackInfo.getTrackGroups(rendererIndex)
+
+                // Pass 1: match by label or language code (most reliable for MKV/MP4 embedded tracks)
+                for (groupIndex in 0 until trackGroupArray.length) {
+                    val group = trackGroupArray[groupIndex]
+                    for (trackIndex in 0 until group.length) {
+                        val format = group.getFormat(trackIndex)
+                        if (name == format.label || name == format.language) {
+                            setAudioTrack(rendererIndex, groupIndex, trackIndex)
+                            return
                         }
+                    }
+                }
+
+                // Pass 2: fallback — match by group index alone when labels are missing/null
+                if (index >= 0 && index < trackGroupArray.length) {
+                    val group = trackGroupArray[index]
+                    if (group.length > 0) {
+                        setAudioTrack(rendererIndex, index, 0)
+                        return
                     }
                 }
             }
         } catch (exception: Exception) {
-            Log.e(TAG, "setAudioTrack failed$exception")
+            Log.e(TAG, "setAudioTrack failed: $exception")
         }
     }
 
