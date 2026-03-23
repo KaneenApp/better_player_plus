@@ -341,8 +341,10 @@ internal class BetterPlayer(
         val mediaItemBuilder = MediaItem.Builder().setUri(uri)
         if (!cacheKey.isNullOrEmpty()) mediaItemBuilder.setCustomCacheKey(cacheKey)
         val mediaItem = mediaItemBuilder.build()
+        // Use explicit parameter name `mgr` to avoid Kotlin shadowing the outer
+        // DrmSessionManager with the MediaItem parameter of the SAM interface.
         val drmSessionManagerProvider: DrmSessionManagerProvider? =
-            drmSessionManager?.let { DrmSessionManagerProvider { it } }
+            drmSessionManager?.let { mgr -> DrmSessionManagerProvider { mgr } }
 
         return when (type) {
             C.CONTENT_TYPE_SS -> SsMediaSource.Factory(
@@ -531,7 +533,7 @@ internal class BetterPlayer(
     //            contains the 2-letter or 3-letter code as a substring.
     //            Last resort before giving up.
     //
-    // After selection, setPreferredAudioLanguage is called so ExoPlayer’s
+    // After selection, setPreferredAudioLanguage is called so ExoPlayer's
     // adaptive logic re-selects the same language after seeks/rebuffers
     // without needing another explicit override call from Dart.
     //
