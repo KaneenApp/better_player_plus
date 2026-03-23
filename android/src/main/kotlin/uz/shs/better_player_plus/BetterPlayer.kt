@@ -614,20 +614,14 @@ internal class BetterPlayer(
 
     /**
      * Create media session which will be used in notifications, pip mode.
-     *
-     * @param context                - android context
-     * @return - configured MediaSession instance
      */
     @SuppressLint("InlinedApi")
     fun setupMediaSession(context: Context?): MediaSessionCompat? {
         mediaSession?.release()
         context?.let {
-
             val mediaButtonIntent = Intent(Intent.ACTION_MEDIA_BUTTON)
             val pendingIntent = PendingIntent.getBroadcast(
-                context,
-                0, mediaButtonIntent,
-                PendingIntent.FLAG_IMMUTABLE
+                context, 0, mediaButtonIntent, PendingIntent.FLAG_IMMUTABLE
             )
             val mediaSession = MediaSessionCompat(context, TAG, null, pendingIntent)
             mediaSession.setCallback(object : MediaSessionCompat.Callback() {
@@ -637,13 +631,10 @@ internal class BetterPlayer(
                 }
             })
             mediaSession.isActive = true
-//            val mediaSessionConnector = MediaSessionConnector(mediaSession)
-//            mediaSessionConnector.setPlayer(exoPlayer)
             this.mediaSession = mediaSession
             return mediaSession
         }
         return null
-
     }
 
     fun onPictureInPictureStatusChanged(inPip: Boolean) {
@@ -658,6 +649,8 @@ internal class BetterPlayer(
         }
         mediaSession = null
     }
+
+    // ── Audio track selection ─────────────────────────────────────────────────
 
     fun setAudioTrack(name: String, index: Int) {
         try {
@@ -688,20 +681,18 @@ internal class BetterPlayer(
                             val label = group.getFormat(groupElementIndex).label
                             // Exact match by label and provided group index
                             if (name == label && index == groupIndex) {
-                                setAudioTrack(rendererIndex, groupIndex, groupElementIndex)
+                                setAudioTrackOverride(rendererIndex, groupIndex, groupElementIndex)
                                 return
                             }
-
-                            ///Fallback option
+                            // Fallback: missing labels — use group index
                             if (!hasStrangeAudioTrack && hasElementWithoutLabel && index == groupIndex) {
-                                // When labels are missing, default to the first track within the group
                                 val safeTrackIndex = if (group.length > 0) 0 else groupElementIndex
-                                setAudioTrack(rendererIndex, groupIndex, safeTrackIndex)
+                                setAudioTrackOverride(rendererIndex, groupIndex, safeTrackIndex)
                                 return
                             }
-                            ///Fallback option
+                            // Fallback: strange track IDs — match by label only
                             if (hasStrangeAudioTrack && name == label) {
-                                setAudioTrack(rendererIndex, groupIndex, groupElementIndex)
+                                setAudioTrackOverride(rendererIndex, groupIndex, groupElementIndex)
                                 return
                             }
                         }
@@ -709,34 +700,120 @@ internal class BetterPlayer(
                 }
             }
         } catch (exception: Exception) {
-            Log.e(TAG, "setAudioTrack failed$exception")
+            Log.e(TAG, "setAudioTrack failed: $exception")
         }
     }
 
-    private fun setAudioTrack(rendererIndex: Int, groupIndex: Int, trackIndex: Int) {
+    private fun setAudioTrackOverride(rendererIndex: Int, groupIndex: Int, trackIndex: Int) {
         val mappedTrackInfo = trackSelector.currentMappedTrackInfo
         if (mappedTrackInfo != null) {
             val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
             if (groupIndex >= 0 && groupIndex < trackGroups.length) {
                 val group = trackGroups.get(groupIndex)
                 val safeTrackIndex = trackIndex.coerceIn(0, group.length - 1)
-
-                val builder = trackSelector.parameters
-                    .buildUpon()
-                    .setRendererDisabled(rendererIndex, false)
-                    .addOverride(
-                        TrackSelectionOverride(
-                            group,
-                            safeTrackIndex
-                        )
-                    )
-
-                trackSelector.setParameters(builder)
+                trackSelector.setParameters(
+                    trackSelector.parameters
+                        .buildUpon()
+                        .setRendererDisabled(rendererIndex, false)
+                        .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                        .addOverride(TrackSelectionOverride(group, safeTrackIndex))
+                        .build()
+                )
             } else {
-                Log.e(TAG, "setAudioTrack: groupIndex out of bounds: $groupIndex")
+                Log.e(TAG, "setAudioTrackOverride: groupIndex out of bounds: $groupIndex")
             }
         }
     }
+
+    // ── Subtitle track selection ──────────────────────────────────────────────
+    //
+    // Dual-pass logic mirrors the audio approach:
+    //   Pass 1 – match by label or language code (e.g. "English", "ar", "en")
+    //   Pass 2 – fall back to the raw group index for unlabelled MKV subs
+    //
+    // Disabling internal subs before applying an external override (or vice
+    // versa) prevents the dreaded double-subtitle situation.
+
+    fun setSubtitleTrack(name: String, index: Int) {
+        try {
+            val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
+
+            for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
+                if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_TEXT) continue
+
+                val trackGroupArray = mappedTrackInfo.getTrackGroups(rendererIndex)
+
+                // Pass 1: match by label or language
+                for (groupIndex in 0 until trackGroupArray.length) {
+                    val group = trackGroupArray[groupIndex]
+                    for (trackIndex in 0 until group.length) {
+                        val format = group.getFormat(trackIndex)
+                        if (name == format.label || name == format.language ||
+                            name.equals(format.label, ignoreCase = true) ||
+                            name.equals(format.language, ignoreCase = true)) {
+                            Log.d(TAG, "setSubtitleTrack: pass-1 match label='${format.label}' lang='${format.language}' at group=$groupIndex track=$trackIndex")
+                            setSubtitleOverride(rendererIndex, groupIndex, trackIndex)
+                            return
+                        }
+                    }
+                }
+
+                // Pass 2: fall back to raw group index for unlabelled MKV tracks
+                if (index >= 0 && index < trackGroupArray.length) {
+                    Log.d(TAG, "setSubtitleTrack: pass-2 index fallback index=$index")
+                    setSubtitleOverride(rendererIndex, index, 0)
+                    return
+                }
+            }
+
+            Log.w(TAG, "setSubtitleTrack: no TEXT renderer or no match for name='$name' index=$index")
+        } catch (e: Exception) {
+            Log.e(TAG, "setSubtitleTrack failed: $e")
+        }
+    }
+
+    fun disableSubtitleTrack() {
+        try {
+            val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
+            for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
+                if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_TEXT) continue
+                trackSelector.setParameters(
+                    trackSelector.parameters
+                        .buildUpon()
+                        .setRendererDisabled(rendererIndex, true)
+                        .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                        .build()
+                )
+                Log.d(TAG, "disableSubtitleTrack: TEXT renderer $rendererIndex disabled")
+                return
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "disableSubtitleTrack failed: $e")
+        }
+    }
+
+    private fun setSubtitleOverride(rendererIndex: Int, groupIdx: Int, trackIdx: Int) {
+        val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
+        val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
+        if (groupIdx < 0 || groupIdx >= trackGroups.length) {
+            Log.e(TAG, "setSubtitleOverride: groupIdx=$groupIdx out of bounds (length=${trackGroups.length})")
+            return
+        }
+        val group = trackGroups.get(groupIdx)
+        val safeTrackIdx = trackIdx.coerceIn(0, group.length - 1)
+        trackSelector.setParameters(
+            trackSelector.parameters
+                .buildUpon()
+                .setRendererDisabled(rendererIndex, false)
+                // Clear any existing text override so switching tracks always works
+                .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                .addOverride(TrackSelectionOverride(group, safeTrackIdx))
+                .build()
+        )
+        Log.d(TAG, "setSubtitleOverride: applied group=$groupIdx track=$safeTrackIdx")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
 
     private fun sendSeekToEvent(positionMs: Long) {
         exoPlayer?.seekTo(positionMs)
@@ -785,7 +862,6 @@ internal class BetterPlayer(
         private const val DEFAULT_NOTIFICATION_CHANNEL = "BETTER_PLAYER_NOTIFICATION"
         private const val NOTIFICATION_ID = 20772077
 
-        //Clear cache without accessing BetterPlayerCache.
         fun clearCache(context: Context?, result: MethodChannel.Result) {
             try {
                 context?.let {
@@ -813,7 +889,6 @@ internal class BetterPlayer(
             }
         }
 
-        //Start pre cache of video. Invoke work manager job and start caching in background.
         fun preCache(
             context: Context?, dataSource: String?, preCacheSize: Long,
             maxCacheSize: Long, maxCacheFileSize: Long, headers: Map<String, String?>,
@@ -842,8 +917,6 @@ internal class BetterPlayer(
             result.success(null)
         }
 
-        //Stop pre cache of video with given url. If there's no work manager job for given url, then
-        //it will be ignored.
         fun stopPreCache(context: Context?, url: String?, result: MethodChannel.Result) {
             if (url != null && context != null) {
                 WorkManager.getInstance(context).cancelAllWorkByTag(url)
@@ -851,5 +924,4 @@ internal class BetterPlayer(
             result.success(null)
         }
     }
-
 }
