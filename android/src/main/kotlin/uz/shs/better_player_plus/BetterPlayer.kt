@@ -160,7 +160,6 @@ internal class BetterPlayer(
                     ) { uuid: UUID? ->
                         try {
                             val mediaDrm = FrameworkMediaDrm.newInstance(uuid!!)
-                            // Force L3.
                             mediaDrm.setPropertyString("securityLevel", "L3")
                             return@setUuidAndExoMediaDrmProvider mediaDrm
                         } catch (_: UnsupportedDrmException) {
@@ -183,10 +182,7 @@ internal class BetterPlayer(
             dataSourceFactory = getDataSourceFactory(userAgent, headers)
             if (useCache && maxCacheSize > 0 && maxCacheFileSize > 0) {
                 dataSourceFactory = CacheDataSourceFactory(
-                    context,
-                    maxCacheSize,
-                    maxCacheFileSize,
-                    dataSourceFactory
+                    context, maxCacheSize, maxCacheFileSize, dataSourceFactory
                 )
             }
         } else {
@@ -212,48 +208,25 @@ internal class BetterPlayer(
         activityName: String
     ) {
         val mediaDescriptionAdapter: MediaDescriptionAdapter = object : MediaDescriptionAdapter {
-            override fun getCurrentContentTitle(player: Player): String {
-                return title
-            }
+            override fun getCurrentContentTitle(player: Player): String = title
 
             @SuppressLint("UnspecifiedImmutableFlag")
             override fun createCurrentContentIntent(player: Player): PendingIntent? {
                 val packageName = context.applicationContext.packageName
                 val notificationIntent = Intent()
-                notificationIntent.setClassName(
-                    packageName,
-                    "$packageName.$activityName"
-                )
-                notificationIntent.flags = (Intent.FLAG_ACTIVITY_CLEAR_TOP
-                        or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                return PendingIntent.getActivity(
-                    context, 0,
-                    notificationIntent,
-                    PendingIntent.FLAG_IMMUTABLE
-                )
+                notificationIntent.setClassName(packageName, "$packageName.$activityName")
+                notificationIntent.flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                return PendingIntent.getActivity(context, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE)
             }
 
-            override fun getCurrentContentText(player: Player): String? {
-                return author
-            }
+            override fun getCurrentContentText(player: Player): String? = author
 
-            override fun getCurrentLargeIcon(
-                player: Player,
-                callback: BitmapCallback
-            ): Bitmap? {
-                if (imageUrl == null) {
-                    return null
-                }
-                if (bitmap != null) {
-                    return bitmap
-                }
+            override fun getCurrentLargeIcon(player: Player, callback: BitmapCallback): Bitmap? {
+                if (imageUrl == null) return null
+                if (bitmap != null) return bitmap
                 val imageWorkRequest = OneTimeWorkRequest.Builder(ImageWorker::class.java)
                     .addTag(imageUrl)
-                    .setInputData(
-                        Data.Builder()
-                            .putString(BetterPlayerPlugin.URL_PARAMETER, imageUrl)
-                            .build()
-                    )
+                    .setInputData(Data.Builder().putString(BetterPlayerPlugin.URL_PARAMETER, imageUrl).build())
                     .build()
                 workManager.enqueue(imageWorkRequest)
                 val workInfoObserver = Observer { workInfo: WorkInfo? ->
@@ -261,22 +234,14 @@ internal class BetterPlayer(
                         if (workInfo != null) {
                             val state = workInfo.state
                             if (state == WorkInfo.State.SUCCEEDED) {
-                                val outputData = workInfo.outputData
-                                val filePath =
-                                    outputData.getString(BetterPlayerPlugin.FILE_PATH_PARAMETER)
-                                //Bitmap here is already processed and it's very small, so it won't
-                                //break anything.
+                                val filePath = workInfo.outputData.getString(BetterPlayerPlugin.FILE_PATH_PARAMETER)
                                 bitmap = BitmapFactory.decodeFile(filePath)
-                                bitmap?.let { bitmap ->
-                                    callback.onBitmap(bitmap)
-                                }
+                                bitmap?.let { callback.onBitmap(it) }
                             }
                             if (state == WorkInfo.State.SUCCEEDED || state == WorkInfo.State.CANCELLED || state == WorkInfo.State.FAILED) {
                                 val uuid = imageWorkRequest.id
-                                val observer = workerObserverMap.remove(uuid)
-                                if (observer != null) {
-                                    workManager.getWorkInfoByIdLiveData(uuid)
-                                        .removeObserver(observer)
+                                workerObserverMap.remove(uuid)?.let {
+                                    workManager.getWorkInfoByIdLiveData(uuid).removeObserver(it)
                                 }
                             }
                         }
@@ -285,38 +250,29 @@ internal class BetterPlayer(
                     }
                 }
                 val workerUuid = imageWorkRequest.id
-                workManager.getWorkInfoByIdLiveData(workerUuid)
-                    .observeForever(workInfoObserver)
+                workManager.getWorkInfoByIdLiveData(workerUuid).observeForever(workInfoObserver)
                 workerObserverMap[workerUuid] = workInfoObserver
                 return null
             }
         }
+
         var playerNotificationChannelName = notificationChannelName
-        if (notificationChannelName == null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val importance = NotificationManager.IMPORTANCE_LOW
-                val channel = NotificationChannel(
-                    DEFAULT_NOTIFICATION_CHANNEL,
-                    DEFAULT_NOTIFICATION_CHANNEL, importance
-                )
-                channel.description = DEFAULT_NOTIFICATION_CHANNEL
-                val notificationManager = context.getSystemService(
-                    NotificationManager::class.java
-                )
-                notificationManager.createNotificationChannel(channel)
-                playerNotificationChannelName = DEFAULT_NOTIFICATION_CHANNEL
-            }
+        if (notificationChannelName == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                DEFAULT_NOTIFICATION_CHANNEL, DEFAULT_NOTIFICATION_CHANNEL, NotificationManager.IMPORTANCE_LOW
+            )
+            channel.description = DEFAULT_NOTIFICATION_CHANNEL
+            context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+            playerNotificationChannelName = DEFAULT_NOTIFICATION_CHANNEL
         }
 
         playerNotificationManager = PlayerNotificationManager.Builder(
-            context, NOTIFICATION_ID,
-            playerNotificationChannelName!!
+            context, NOTIFICATION_ID, playerNotificationChannelName!!
         ).setMediaDescriptionAdapter(mediaDescriptionAdapter).build()
 
         playerNotificationManager?.apply {
-
             exoPlayer?.let {
-                setPlayer(ForwardingPlayer(exoPlayer))
+                setPlayer(ForwardingPlayer(it))
                 setUseNextAction(false)
                 setUsePreviousAction(false)
                 setUseStopAction(false)
@@ -340,6 +296,7 @@ internal class BetterPlayer(
             refreshHandler?.postDelayed(refreshRunnable!!, 1000)
         }
         refreshHandler?.postDelayed(refreshRunnable!!, 0)
+
         exoPlayerEventListener = object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 mediaSession?.setMetadata(
@@ -349,24 +306,16 @@ internal class BetterPlayer(
                 )
             }
         }
-        exoPlayerEventListener?.let { exoPlayerEventListener ->
-            exoPlayer?.addListener(exoPlayerEventListener)
-        }
+        exoPlayerEventListener?.let { exoPlayer?.addListener(it) }
         exoPlayer?.seekTo(0)
     }
 
     fun disposeRemoteNotifications() {
-        exoPlayerEventListener?.let { exoPlayerEventListener ->
-            exoPlayer?.removeListener(exoPlayerEventListener)
-        }
-        if (refreshHandler != null) {
-            refreshHandler?.removeCallbacksAndMessages(null)
-            refreshHandler = null
-            refreshRunnable = null
-        }
-        if (playerNotificationManager != null) {
-            playerNotificationManager?.setPlayer(null)
-        }
+        exoPlayerEventListener?.let { exoPlayer?.removeListener(it) }
+        refreshHandler?.removeCallbacksAndMessages(null)
+        refreshHandler = null
+        refreshRunnable = null
+        playerNotificationManager?.setPlayer(null)
         bitmap = null
     }
 
@@ -377,87 +326,53 @@ internal class BetterPlayer(
         cacheKey: String?,
         context: Context
     ): MediaSource {
-        val type: Int
-        if (formatHint == null) {
-            var lastPathSegment = uri?.lastPathSegment
-            if (lastPathSegment == null) {
-                lastPathSegment = ""
-            }
-            type = Util.inferContentTypeForExtension(lastPathSegment.split(".")[1])
+        val type: Int = if (formatHint == null) {
+            var lastPathSegment = uri?.lastPathSegment ?: ""
+            Util.inferContentTypeForExtension(lastPathSegment.split(".").last())
         } else {
-            type = when (formatHint) {
-                FORMAT_SS -> C.CONTENT_TYPE_SS
-                FORMAT_DASH -> C.CONTENT_TYPE_DASH
-                FORMAT_HLS -> C.CONTENT_TYPE_HLS
+            when (formatHint) {
+                FORMAT_SS    -> C.CONTENT_TYPE_SS
+                FORMAT_DASH  -> C.CONTENT_TYPE_DASH
+                FORMAT_HLS   -> C.CONTENT_TYPE_HLS
                 FORMAT_OTHER -> C.CONTENT_TYPE_OTHER
-                else -> -1
+                else         -> -1
             }
         }
-        val mediaItemBuilder = MediaItem.Builder()
-        mediaItemBuilder.setUri(uri)
-        if (!cacheKey.isNullOrEmpty()) {
-            mediaItemBuilder.setCustomCacheKey(cacheKey)
-        }
+        val mediaItemBuilder = MediaItem.Builder().setUri(uri)
+        if (!cacheKey.isNullOrEmpty()) mediaItemBuilder.setCustomCacheKey(cacheKey)
         val mediaItem = mediaItemBuilder.build()
-        val drmSessionManagerProvider: DrmSessionManagerProvider? = drmSessionManager?.let { drmSessionManager ->
-            DrmSessionManagerProvider { drmSessionManager }
-        }
+        val drmSessionManagerProvider: DrmSessionManagerProvider? =
+            drmSessionManager?.let { DrmSessionManagerProvider { it } }
 
         return when (type) {
             C.CONTENT_TYPE_SS -> SsMediaSource.Factory(
                 DefaultSsChunkSource.Factory(mediaDataSourceFactory),
                 DefaultDataSource.Factory(context, mediaDataSourceFactory)
-            ).apply {
-                if (drmSessionManagerProvider != null) {
-                    setDrmSessionManagerProvider(drmSessionManagerProvider)
-                }
-            }.createMediaSource(mediaItem)
+            ).apply { drmSessionManagerProvider?.let { setDrmSessionManagerProvider(it) } }.createMediaSource(mediaItem)
 
             C.CONTENT_TYPE_DASH -> DashMediaSource.Factory(
                 DefaultDashChunkSource.Factory(mediaDataSourceFactory),
                 DefaultDataSource.Factory(context, mediaDataSourceFactory)
-            ).apply {
-                if (drmSessionManagerProvider != null) {
-                    setDrmSessionManagerProvider(drmSessionManagerProvider)
-                }
-            }.createMediaSource(mediaItem)
+            ).apply { drmSessionManagerProvider?.let { setDrmSessionManagerProvider(it) } }.createMediaSource(mediaItem)
 
             C.CONTENT_TYPE_HLS -> HlsMediaSource.Factory(mediaDataSourceFactory)
-                .apply {
-                    if (drmSessionManagerProvider != null) {
-                        setDrmSessionManagerProvider(drmSessionManagerProvider)
-                    }
-                }.createMediaSource(mediaItem)
+                .apply { drmSessionManagerProvider?.let { setDrmSessionManagerProvider(it) } }.createMediaSource(mediaItem)
 
             C.CONTENT_TYPE_OTHER -> ProgressiveMediaSource.Factory(
-                mediaDataSourceFactory,
-                DefaultExtractorsFactory()
-            ).apply {
-                if (drmSessionManagerProvider != null) {
-                    setDrmSessionManagerProvider(drmSessionManagerProvider)
-                }
-            }.createMediaSource(mediaItem)
+                mediaDataSourceFactory, DefaultExtractorsFactory()
+            ).apply { drmSessionManagerProvider?.let { setDrmSessionManagerProvider(it) } }.createMediaSource(mediaItem)
 
-            else -> {
-                throw IllegalStateException("Unsupported type: $type")
-            }
+            else -> throw IllegalStateException("Unsupported type: $type")
         }
     }
 
     private fun setupVideoPlayer(
         eventChannel: EventChannel, textureEntry: SurfaceTextureEntry, result: MethodChannel.Result
     ) {
-        eventChannel.setStreamHandler(
-            object : EventChannel.StreamHandler {
-                override fun onListen(o: Any?, sink: EventSink) {
-                    eventSink.setDelegate(sink)
-                }
-
-                override fun onCancel(o: Any?) {
-                    eventSink.setDelegate(null)
-                }
-            },
-        )
+        eventChannel.setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(o: Any?, sink: EventSink) { eventSink.setDelegate(sink) }
+            override fun onCancel(o: Any?) { eventSink.setDelegate(null) }
+        })
         surface = Surface(textureEntry.surfaceTexture())
         exoPlayer?.setVideoSurface(surface)
         setAudioAttributes(exoPlayer, true)
@@ -466,34 +381,18 @@ internal class BetterPlayer(
                 when (playbackState) {
                     Player.STATE_BUFFERING -> {
                         sendBufferingUpdate(true)
-                        val event: MutableMap<String, Any> = HashMap()
-                        event["event"] = "bufferingStart"
-                        eventSink.success(event)
+                        eventSink.success(hashMapOf("event" to "bufferingStart"))
                     }
-
                     Player.STATE_READY -> {
-                        if (!isInitialized) {
-                            isInitialized = true
-                            sendInitialized()
-                        }
-                        val event: MutableMap<String, Any> = HashMap()
-                        event["event"] = "bufferingEnd"
-                        eventSink.success(event)
+                        if (!isInitialized) { isInitialized = true; sendInitialized() }
+                        eventSink.success(hashMapOf("event" to "bufferingEnd"))
                     }
-
                     Player.STATE_ENDED -> {
-                        val event: MutableMap<String, Any?> = HashMap()
-                        event["event"] = "completed"
-                        event["key"] = key
-                        eventSink.success(event)
+                        eventSink.success(hashMapOf("event" to "completed", "key" to key))
                     }
-
-                    Player.STATE_IDLE -> {
-                        //no-op
-                    }
+                    Player.STATE_IDLE -> { /* no-op */ }
                 }
             }
-
             override fun onPlayerError(error: PlaybackException) {
                 eventSink.error("VideoError", "Video player had error $error", "")
             }
@@ -508,9 +407,7 @@ internal class BetterPlayer(
         if (isFromBufferingStart || bufferedPosition != lastSendBufferedPosition) {
             val event: MutableMap<String, Any> = HashMap()
             event["event"] = "bufferingUpdate"
-            val range: List<Number?> = listOf(0, bufferedPosition)
-            // iOS supports a list of buffered ranges, so here is a list with a single range.
-            event["values"] = listOf(range)
+            event["values"] = listOf(listOf(0, bufferedPosition))
             eventSink.success(event)
             lastSendBufferedPosition = bufferedPosition
         }
@@ -519,45 +416,30 @@ internal class BetterPlayer(
     @Suppress("DEPRECATION")
     private fun setAudioAttributes(exoPlayer: ExoPlayer?, mixWithOthers: Boolean) {
         exoPlayer?.setAudioAttributes(
-            AudioAttributes.Builder()
-                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
-                .build(),
+            AudioAttributes.Builder().setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(),
             !mixWithOthers
         )
     }
 
-    fun play() {
-        exoPlayer?.playWhenReady = true
-    }
-
-    fun pause() {
-        exoPlayer?.playWhenReady = false
-    }
+    fun play()    { exoPlayer?.playWhenReady = true }
+    fun pause()   { exoPlayer?.playWhenReady = false }
 
     fun setLooping(value: Boolean) {
         exoPlayer?.repeatMode = if (value) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
     }
 
     fun setVolume(value: Double) {
-        val bracketedValue = max(0.0, min(1.0, value))
-            .toFloat()
-        exoPlayer?.volume = bracketedValue
+        exoPlayer?.volume = max(0.0, min(1.0, value)).toFloat()
     }
 
     fun setSpeed(value: Double) {
-        val bracketedValue = value.toFloat()
-        val playbackParameters = PlaybackParameters(bracketedValue)
-        exoPlayer?.playbackParameters = playbackParameters
+        exoPlayer?.playbackParameters = PlaybackParameters(value.toFloat())
     }
 
     fun setTrackParameters(width: Int, height: Int, bitrate: Int) {
         val parametersBuilder = trackSelector.buildUponParameters()
-        if (width != 0 && height != 0) {
-            parametersBuilder.setMaxVideoSize(width, height)
-        }
-        if (bitrate != 0) {
-            parametersBuilder.setMaxVideoBitrate(bitrate)
-        }
+        if (width != 0 && height != 0) parametersBuilder.setMaxVideoSize(width, height)
+        if (bitrate != 0) parametersBuilder.setMaxVideoBitrate(bitrate)
         if (width == 0 && height == 0 && bitrate == 0) {
             parametersBuilder.clearVideoSizeConstraints()
             parametersBuilder.setMaxVideoBitrate(Int.MAX_VALUE)
@@ -565,211 +447,307 @@ internal class BetterPlayer(
         trackSelector.setParameters(parametersBuilder)
     }
 
-    fun seekTo(location: Int) {
-        exoPlayer?.seekTo(location.toLong())
+    fun seekTo(location: Int) { exoPlayer?.seekTo(location.toLong()) }
+
+    val position: Long get() = exoPlayer?.currentPosition ?: 0L
+
+    val absolutePosition: Long get() {
+        exoPlayer?.let { player ->
+            val timeline = player.currentTimeline
+            if (!timeline.isEmpty) {
+                val windowStartTimeMs = timeline.getWindow(0, Timeline.Window()).windowStartTimeMs
+                return windowStartTimeMs + player.currentPosition
+            }
+        }
+        return exoPlayer?.currentPosition ?: 0L
     }
 
-    val position: Long
-        get() = exoPlayer?.currentPosition ?: 0L
-
-    val absolutePosition: Long
-        get() {
-            exoPlayer?.let { player ->
-                val timeline = player.currentTimeline
-                if (!timeline.isEmpty) {
-                    val windowStartTimeMs =
-                        timeline.getWindow(0, Timeline.Window()).windowStartTimeMs
-                    val pos = player.currentPosition
-                    return windowStartTimeMs + pos
-                }
-            }
-            return exoPlayer?.currentPosition ?: 0L
-        }
-
     private fun sendInitialized() {
-        if (isInitialized) {
-            val event: MutableMap<String, Any?> = HashMap()
-            event["event"] = "initialized"
-            event["key"] = key
-            event["duration"] = getDuration()
-            exoPlayer?.let { player ->
-                player.videoFormat?.let { videoFormat ->
-                    var width = videoFormat.width
-                    var height = videoFormat.height
-                    val rotationDegrees = videoFormat.rotationDegrees
-                    // Switch the width/height if video was taken in portrait mode
-                    if (rotationDegrees == 90 || rotationDegrees == 270) {
-                        width = videoFormat.height
-                        height = videoFormat.width
-                    }
-                    event["width"] = width
-                    event["height"] = height
-                }
-            }
-            eventSink.success(event)
+        if (!isInitialized) return
+        val event: MutableMap<String, Any?> = HashMap()
+        event["event"]    = "initialized"
+        event["key"]      = key
+        event["duration"] = getDuration()
+        exoPlayer?.videoFormat?.let { fmt ->
+            var w = fmt.width; var h = fmt.height
+            if (fmt.rotationDegrees == 90 || fmt.rotationDegrees == 270) { w = fmt.height; h = fmt.width }
+            event["width"] = w; event["height"] = h
         }
+        eventSink.success(event)
     }
 
     private fun getDuration(): Long = exoPlayer?.duration ?: 0L
 
-    /**
-     * Create media session which will be used in notifications, pip mode.
-     */
     @SuppressLint("InlinedApi")
     fun setupMediaSession(context: Context?): MediaSessionCompat? {
         mediaSession?.release()
         context?.let {
-            val mediaButtonIntent = Intent(Intent.ACTION_MEDIA_BUTTON)
             val pendingIntent = PendingIntent.getBroadcast(
-                context, 0, mediaButtonIntent, PendingIntent.FLAG_IMMUTABLE
+                it, 0, Intent(Intent.ACTION_MEDIA_BUTTON), PendingIntent.FLAG_IMMUTABLE
             )
-            val mediaSession = MediaSessionCompat(context, TAG, null, pendingIntent)
-            mediaSession.setCallback(object : MediaSessionCompat.Callback() {
-                override fun onSeekTo(pos: Long) {
-                    sendSeekToEvent(pos)
-                    super.onSeekTo(pos)
-                }
+            val ms = MediaSessionCompat(it, TAG, null, pendingIntent)
+            ms.setCallback(object : MediaSessionCompat.Callback() {
+                override fun onSeekTo(pos: Long) { sendSeekToEvent(pos); super.onSeekTo(pos) }
             })
-            mediaSession.isActive = true
-            this.mediaSession = mediaSession
-            return mediaSession
+            ms.isActive = true
+            mediaSession = ms
+            return ms
         }
         return null
     }
 
     fun onPictureInPictureStatusChanged(inPip: Boolean) {
-        val event: MutableMap<String, Any> = HashMap()
-        event["event"] = if (inPip) "pipStart" else "pipStop"
-        eventSink.success(event)
+        eventSink.success(hashMapOf("event" to if (inPip) "pipStart" else "pipStop"))
     }
 
     fun disposeMediaSession() {
-        if (mediaSession != null) {
-            mediaSession?.release()
-        }
+        mediaSession?.release()
         mediaSession = null
     }
 
-    // ── Audio track selection ─────────────────────────────────────────────────
+    // =========================================================================
+    // Audio track selection
+    // =========================================================================
+    //
+    // Strategy (four passes, applied in order — first match wins):
+    //
+    //  Pass 1 — Exact language code match (format.language vs all ISO variants
+    //            of the requested lang).  Catches tracks that have a proper
+    //            BCP-47 / ISO 639 language tag but no human-readable label.
+    //
+    //  Pass 2 — Exact label match (case-insensitive) against the requested
+    //            language name, 2-letter code, or 3-letter code.
+    //            Catches tracks whose label is "Arabic", "ara", or "ar".
+    //
+    //  Pass 3 — Group-index fallback.  Used when ALL tracks in the renderer
+    //            have null labels (common in unlabelled MKV containers).
+    //            The Dart side passes the raw container index, so we honour it
+    //            directly.  The "strange track" heuristic that previously
+    //            special-cased id=="1/15" is replaced by a broader check:
+    //            if ANY track has a non-null, non-numeric, non-empty ID that
+    //            looks like an IPTV/HLS composite key, we skip this pass.
+    //
+    //  Pass 4 — Label-contains fallback.  Checks whether any track label
+    //            contains the 2-letter or 3-letter code as a substring.
+    //            Last resort before giving up.
+    //
+    // After selection, setPreferredAudioLanguage is called so ExoPlayer’s
+    // adaptive logic re-selects the same language after seeks/rebuffers
+    // without needing another explicit override call from Dart.
+    //
+    // clearOverridesOfType(TRACK_TYPE_AUDIO) is called before addOverride so
+    // switching back to a previously-active track always takes effect.
+
+    private val iso1to3 = mapOf(
+        "en" to "eng", "ar" to "ara", "fr" to "fra", "de" to "deu",
+        "es" to "spa", "it" to "ita", "pt" to "por", "ja" to "jpn",
+        "ko" to "kor", "zh" to "zho", "tr" to "tur", "hi" to "hin",
+        "ru" to "rus", "nl" to "nld", "pl" to "pol", "sv" to "swe",
+        "he" to "heb", "fa" to "fas"
+    )
+
+    private val iso3to1 = mapOf(
+        "eng" to "en", "ara" to "ar", "fra" to "fr", "fre" to "fr",
+        "deu" to "de", "ger" to "de", "spa" to "es", "ita" to "it",
+        "por" to "pt", "jpn" to "ja", "kor" to "ko", "zho" to "zh",
+        "chi" to "zh", "tur" to "tr", "hin" to "hi", "rus" to "ru",
+        "nld" to "nl", "dut" to "nl", "pol" to "pl", "swe" to "sv",
+        "heb" to "he", "fas" to "fa", "per" to "fa"
+    )
+
+    private val langDisplayNames = mapOf(
+        "ar" to "arabic",  "en" to "english", "fr" to "french",  "de" to "german",
+        "es" to "spanish", "it" to "italian", "pt" to "portuguese","ja" to "japanese",
+        "ko" to "korean",  "zh" to "chinese", "tr" to "turkish", "hi" to "hindi",
+        "ru" to "russian", "nl" to "dutch",   "pl" to "polish",  "sv" to "swedish",
+        "he" to "hebrew",  "fa" to "persian"
+    )
+
+    /** Normalise any ISO code to 2-letter lowercase, e.g. "ara" → "ar". */
+    private fun normLang(raw: String): String = iso3to1[raw.lowercase().trim()] ?: raw.lowercase().trim()
+
+    /**
+     * All ISO variants of a language code, e.g. "ar" → {"ar", "ara", "arabic"}.
+     * Used for broad matching against format.language and format.label fields.
+     */
+    private fun isoVariants(langCode: String): Set<String> {
+        val lc    = langCode.lowercase().trim()
+        val norm1 = normLang(lc)                   // 2-letter
+        val norm3 = iso1to3[norm1] ?: norm1        // 3-letter
+        val name  = langDisplayNames[norm1] ?: ""   // display name (lowercase)
+        return setOf(lc, norm1, norm3, name).filter { it.isNotEmpty() }.toSet()
+    }
+
+    /**
+     * True when a track ID looks like an IPTV/HLS composite key (e.g. "1/15",
+     * "audio:0", "stream_0") rather than a plain integer or null.  When any
+     * track has such an ID, the "null-label group-index" fallback (pass 3)
+     * is unsafe and skipped.
+     */
+    private fun hasCompositeTrackIds(trackGroupArray: androidx.media3.common.TrackGroup): Boolean {
+        for (i in 0 until trackGroupArray.length) {
+            val id = trackGroupArray.getFormat(i).id ?: continue
+            if (id.contains('/') || id.contains(':') || id.contains('_')) return true
+        }
+        return false
+    }
 
     fun setAudioTrack(name: String, index: Int) {
         try {
-            val mappedTrackInfo = trackSelector.currentMappedTrackInfo
-            if (mappedTrackInfo != null) {
-                for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
-                    if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) {
-                        continue
-                    }
-                    val trackGroupArray = mappedTrackInfo.getTrackGroups(rendererIndex)
-                    var hasElementWithoutLabel = false
-                    var hasStrangeAudioTrack = false
-                    for (groupIndex in 0 until trackGroupArray.length) {
-                        val group = trackGroupArray[groupIndex]
-                        for (groupElementIndex in 0 until group.length) {
-                            val format = group.getFormat(groupElementIndex)
-                            if (format.label == null) {
-                                hasElementWithoutLabel = true
-                            }
-                            if (format.id != null && format.id == "1/15") {
-                                hasStrangeAudioTrack = true
-                            }
-                        }
-                    }
-                    for (groupIndex in 0 until trackGroupArray.length) {
-                        val group = trackGroupArray[groupIndex]
-                        for (groupElementIndex in 0 until group.length) {
-                            val label = group.getFormat(groupElementIndex).label
-                            // Exact match by label and provided group index
-                            if (name == label && index == groupIndex) {
-                                setAudioTrackOverride(rendererIndex, groupIndex, groupElementIndex)
-                                return
-                            }
-                            // Fallback: missing labels — use group index
-                            if (!hasStrangeAudioTrack && hasElementWithoutLabel && index == groupIndex) {
-                                val safeTrackIndex = if (group.length > 0) 0 else groupElementIndex
-                                setAudioTrackOverride(rendererIndex, groupIndex, safeTrackIndex)
-                                return
-                            }
-                            // Fallback: strange track IDs — match by label only
-                            if (hasStrangeAudioTrack && name == label) {
-                                setAudioTrackOverride(rendererIndex, groupIndex, groupElementIndex)
-                                return
-                            }
-                        }
-                    }
-                }
+            val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: run {
+                Log.w(TAG, "setAudioTrack: no mapped track info yet")
+                return
             }
-        } catch (exception: Exception) {
-            Log.e(TAG, "setAudioTrack failed: $exception")
-        }
-    }
 
-    private fun setAudioTrackOverride(rendererIndex: Int, groupIndex: Int, trackIndex: Int) {
-        val mappedTrackInfo = trackSelector.currentMappedTrackInfo
-        if (mappedTrackInfo != null) {
-            val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
-            if (groupIndex >= 0 && groupIndex < trackGroups.length) {
-                val group = trackGroups.get(groupIndex)
-                val safeTrackIndex = trackIndex.coerceIn(0, group.length - 1)
-                trackSelector.setParameters(
-                    trackSelector.parameters
-                        .buildUpon()
-                        .setRendererDisabled(rendererIndex, false)
-                        .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
-                        .addOverride(TrackSelectionOverride(group, safeTrackIndex))
-                        .build()
-                )
-            } else {
-                Log.e(TAG, "setAudioTrackOverride: groupIndex out of bounds: $groupIndex")
-            }
-        }
-    }
+            // Compute all ISO variants of the requested language once.
+            val variants = isoVariants(name)           // e.g. {"ar","ara","arabic"}
+            val norm1    = normLang(name)              // 2-letter for setPreferredAudioLanguage
+            val norm3    = iso1to3[norm1] ?: norm1     // 3-letter
 
-    // ── Subtitle track selection ──────────────────────────────────────────────
-    //
-    // Dual-pass logic mirrors the audio approach:
-    //   Pass 1 – match by label or language code (e.g. "English", "ar", "en")
-    //   Pass 2 – fall back to the raw group index for unlabelled MKV subs
-    //
-    // Disabling internal subs before applying an external override (or vice
-    // versa) prevents the dreaded double-subtitle situation.
-
-    fun setSubtitleTrack(name: String, index: Int) {
-        try {
-            val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
+            Log.d(TAG, "setAudioTrack: name=\"$name\" index=$index variants=$variants")
 
             for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
-                if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_TEXT) continue
+                if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) continue
 
                 val trackGroupArray = mappedTrackInfo.getTrackGroups(rendererIndex)
+                if (trackGroupArray.length == 0) continue
 
-                // Pass 1: match by label or language
-                for (groupIndex in 0 until trackGroupArray.length) {
-                    val group = trackGroupArray[groupIndex]
-                    for (trackIndex in 0 until group.length) {
-                        val format = group.getFormat(trackIndex)
-                        if (name == format.label || name == format.language ||
-                            name.equals(format.label, ignoreCase = true) ||
-                            name.equals(format.language, ignoreCase = true)) {
-                            Log.d(TAG, "setSubtitleTrack: pass-1 match label='${format.label}' lang='${format.language}' at group=$groupIndex track=$trackIndex")
-                            setSubtitleOverride(rendererIndex, groupIndex, trackIndex)
+                // Determine renderer-wide characteristics once.
+                var allLabelsNull      = true
+                var anyCompositeId     = false
+                for (gi in 0 until trackGroupArray.length) {
+                    val grp = trackGroupArray[gi]
+                    if (hasCompositeTrackIds(grp)) anyCompositeId = true
+                    for (ti in 0 until grp.length) {
+                        if (grp.getFormat(ti).label != null) allLabelsNull = false
+                    }
+                }
+
+                // ── Pass 1: exact language-code match ──────────────────────────────
+                // format.language carries the BCP-47 / ISO 639 tag assigned by
+                // the container parser.  This is the most reliable field.
+                for (gi in 0 until trackGroupArray.length) {
+                    val grp = trackGroupArray[gi]
+                    for (ti in 0 until grp.length) {
+                        val fmt   = grp.getFormat(ti)
+                        val fLang = (fmt.language ?: "").lowercase().trim()
+                        if (fLang.isEmpty()) continue
+                        val fNorm = normLang(fLang)
+                        if (fNorm == norm1 || fLang == norm3 || fLang in variants) {
+                            Log.d(TAG, "setAudioTrack: pass-1 lang match fLang=\"$fLang\" gi=$gi ti=$ti")
+                            applyAudioTrackOverride(rendererIndex, gi, ti, norm1)
                             return
                         }
                     }
                 }
 
-                // Pass 2: fall back to raw group index for unlabelled MKV tracks
-                if (index >= 0 && index < trackGroupArray.length) {
-                    Log.d(TAG, "setSubtitleTrack: pass-2 index fallback index=$index")
-                    setSubtitleOverride(rendererIndex, index, 0)
+                // ── Pass 2: exact label match (case-insensitive) ───────────────────
+                for (gi in 0 until trackGroupArray.length) {
+                    val grp = trackGroupArray[gi]
+                    for (ti in 0 until grp.length) {
+                        val fmt    = grp.getFormat(ti)
+                        val fLabel = (fmt.label ?: "").lowercase().trim()
+                        if (fLabel.isEmpty()) continue
+                        if (fLabel in variants) {
+                            Log.d(TAG, "setAudioTrack: pass-2 label match fLabel=\"$fLabel\" gi=$gi ti=$ti")
+                            applyAudioTrackOverride(rendererIndex, gi, ti, norm1)
+                            return
+                        }
+                    }
+                }
+
+                // ── Pass 3: null-label group-index fallback ───────────────────────
+                // Safe only when all tracks are unlabelled (MKV without metadata)
+                // and none have composite IDs (IPTV/HLS).
+                if (allLabelsNull && !anyCompositeId && index >= 0 && index < trackGroupArray.length) {
+                    Log.d(TAG, "setAudioTrack: pass-3 index fallback index=$index")
+                    applyAudioTrackOverride(rendererIndex, index, 0, norm1)
                     return
                 }
-            }
 
-            Log.w(TAG, "setSubtitleTrack: no TEXT renderer or no match for name='$name' index=$index")
+                // ── Pass 4: label-contains substring fallback ────────────────────
+                for (gi in 0 until trackGroupArray.length) {
+                    val grp = trackGroupArray[gi]
+                    for (ti in 0 until grp.length) {
+                        val fLabel = (grp.getFormat(ti).label ?: "").lowercase()
+                        if (variants.any { v -> fLabel.contains(v) }) {
+                            Log.d(TAG, "setAudioTrack: pass-4 contains match fLabel=\"$fLabel\" gi=$gi ti=$ti")
+                            applyAudioTrackOverride(rendererIndex, gi, ti, norm1)
+                            return
+                        }
+                    }
+                }
+
+                Log.w(TAG, "setAudioTrack: no match found for name=\"$name\" index=$index")
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "setSubtitleTrack failed: $e")
+            Log.e(TAG, "setAudioTrack failed: $e")
         }
+    }
+
+    /**
+     * Apply the track selector override and set the preferred audio language
+     * so ExoPlayer's adaptive logic re-selects this language automatically
+     * after seeks and rebuffers, without needing another Dart call.
+     */
+    private fun applyAudioTrackOverride(
+        rendererIndex: Int,
+        groupIndex: Int,
+        trackIndex: Int,
+        preferredLang: String  // 2-letter ISO 639-1
+    ) {
+        val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
+        val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
+        if (groupIndex < 0 || groupIndex >= trackGroups.length) {
+            Log.e(TAG, "applyAudioTrackOverride: groupIndex=$groupIndex out of bounds (len=${trackGroups.length})")
+            return
+        }
+        val group = trackGroups[groupIndex]
+        val safeTrack = trackIndex.coerceIn(0, group.length - 1)
+
+        // setPreferredAudioLanguage ensures the adaptive selector re-picks
+        // the same language after a seek or mid-stream rebuffer.  We set
+        // both ISO forms so ExoPlayer recognises either tag format.
+        val norm3 = iso1to3[preferredLang] ?: preferredLang
+        trackSelector.setParameters(
+            trackSelector.parameters
+                .buildUpon()
+                .setRendererDisabled(rendererIndex, false)
+                .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                .addOverride(TrackSelectionOverride(group, safeTrack))
+                .setPreferredAudioLanguage(norm3)   // sticky: survives seeks/rebuffers
+                .build()
+        )
+        Log.d(TAG, "applyAudioTrackOverride: renderer=$rendererIndex group=$groupIndex track=$safeTrack lang=$preferredLang/$norm3")
+    }
+
+    // =========================================================================
+    // Subtitle track selection
+    // =========================================================================
+
+    fun setSubtitleTrack(name: String, index: Int) {
+        try {
+            val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
+            for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
+                if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_TEXT) continue
+                val trackGroupArray = mappedTrackInfo.getTrackGroups(rendererIndex)
+                // Pass 1: label or language match
+                for (gi in 0 until trackGroupArray.length) {
+                    val grp = trackGroupArray[gi]
+                    for (ti in 0 until grp.length) {
+                        val fmt = grp.getFormat(ti)
+                        if (name.equals(fmt.label, ignoreCase = true) ||
+                            name.equals(fmt.language, ignoreCase = true)) {
+                            setSubtitleOverride(rendererIndex, gi, ti); return
+                        }
+                    }
+                }
+                // Pass 2: index fallback
+                if (index >= 0 && index < trackGroupArray.length) {
+                    setSubtitleOverride(rendererIndex, index, 0); return
+                }
+            }
+        } catch (e: Exception) { Log.e(TAG, "setSubtitleTrack failed: $e") }
     }
 
     fun disableSubtitleTrack() {
@@ -778,61 +756,43 @@ internal class BetterPlayer(
             for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
                 if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_TEXT) continue
                 trackSelector.setParameters(
-                    trackSelector.parameters
-                        .buildUpon()
+                    trackSelector.parameters.buildUpon()
                         .setRendererDisabled(rendererIndex, true)
                         .clearOverridesOfType(C.TRACK_TYPE_TEXT)
                         .build()
                 )
-                Log.d(TAG, "disableSubtitleTrack: TEXT renderer $rendererIndex disabled")
                 return
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "disableSubtitleTrack failed: $e")
-        }
+        } catch (e: Exception) { Log.e(TAG, "disableSubtitleTrack failed: $e") }
     }
 
     private fun setSubtitleOverride(rendererIndex: Int, groupIdx: Int, trackIdx: Int) {
         val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
         val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
-        if (groupIdx < 0 || groupIdx >= trackGroups.length) {
-            Log.e(TAG, "setSubtitleOverride: groupIdx=$groupIdx out of bounds (length=${trackGroups.length})")
-            return
-        }
-        val group = trackGroups.get(groupIdx)
-        val safeTrackIdx = trackIdx.coerceIn(0, group.length - 1)
+        if (groupIdx < 0 || groupIdx >= trackGroups.length) return
+        val group = trackGroups[groupIdx]
         trackSelector.setParameters(
-            trackSelector.parameters
-                .buildUpon()
+            trackSelector.parameters.buildUpon()
                 .setRendererDisabled(rendererIndex, false)
-                // Clear any existing text override so switching tracks always works
                 .clearOverridesOfType(C.TRACK_TYPE_TEXT)
-                .addOverride(TrackSelectionOverride(group, safeTrackIdx))
+                .addOverride(TrackSelectionOverride(group, trackIdx.coerceIn(0, group.length - 1)))
                 .build()
         )
-        Log.d(TAG, "setSubtitleOverride: applied group=$groupIdx track=$safeTrackIdx")
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
+    // =========================================================================
 
     private fun sendSeekToEvent(positionMs: Long) {
         exoPlayer?.seekTo(positionMs)
-        val event: MutableMap<String, Any> = HashMap()
-        event["event"] = "seek"
-        event["position"] = positionMs
-        eventSink.success(event)
+        eventSink.success(hashMapOf("event" to "seek", "position" to positionMs))
     }
 
-    fun setMixWithOthers(mixWithOthers: Boolean) {
-        setAudioAttributes(exoPlayer, mixWithOthers)
-    }
+    fun setMixWithOthers(mixWithOthers: Boolean) = setAudioAttributes(exoPlayer, mixWithOthers)
 
     fun dispose() {
         disposeMediaSession()
         disposeRemoteNotifications()
-        if (isInitialized) {
-            exoPlayer?.stop()
-        }
+        if (isInitialized) exoPlayer?.stop()
         textureEntry.release()
         eventChannel.setStreamHandler(null)
         surface?.release()
@@ -855,38 +815,26 @@ internal class BetterPlayer(
 
     companion object {
         private const val TAG = "BetterPlayer"
-        private const val FORMAT_SS = "ss"
-        private const val FORMAT_DASH = "dash"
-        private const val FORMAT_HLS = "hls"
+        private const val FORMAT_SS    = "ss"
+        private const val FORMAT_DASH  = "dash"
+        private const val FORMAT_HLS   = "hls"
         private const val FORMAT_OTHER = "other"
         private const val DEFAULT_NOTIFICATION_CHANNEL = "BETTER_PLAYER_NOTIFICATION"
         private const val NOTIFICATION_ID = 20772077
 
         fun clearCache(context: Context?, result: MethodChannel.Result) {
             try {
-                context?.let {
-                    val file = File(it.cacheDir, "betterPlayerCache")
-                    deleteDirectory(file)
-                }
+                context?.let { deleteDirectory(File(it.cacheDir, "betterPlayerCache")) }
                 result.success(null)
-            } catch (exception: Exception) {
-                Log.e(TAG, exception.toString())
+            } catch (e: Exception) {
+                Log.e(TAG, e.toString())
                 result.error("", "", "")
             }
         }
 
         private fun deleteDirectory(file: File) {
-            if (file.isDirectory) {
-                val entries = file.listFiles()
-                if (entries != null) {
-                    for (entry in entries) {
-                        deleteDirectory(entry)
-                    }
-                }
-            }
-            if (!file.delete()) {
-                Log.e(TAG, "Failed to delete cache dir.")
-            }
+            if (file.isDirectory) file.listFiles()?.forEach { deleteDirectory(it) }
+            if (!file.delete()) Log.e(TAG, "Failed to delete cache dir.")
         }
 
         fun preCache(
@@ -899,28 +847,21 @@ internal class BetterPlayer(
                 .putLong(BetterPlayerPlugin.PRE_CACHE_SIZE_PARAMETER, preCacheSize)
                 .putLong(BetterPlayerPlugin.MAX_CACHE_SIZE_PARAMETER, maxCacheSize)
                 .putLong(BetterPlayerPlugin.MAX_CACHE_FILE_SIZE_PARAMETER, maxCacheFileSize)
-            if (cacheKey != null) {
-                dataBuilder.putString(BetterPlayerPlugin.CACHE_KEY_PARAMETER, cacheKey)
-            }
-            for (headerKey in headers.keys) {
-                dataBuilder.putString(
-                    BetterPlayerPlugin.HEADER_PARAMETER + headerKey,
-                    headers[headerKey]
-                )
-            }
+            if (cacheKey != null) dataBuilder.putString(BetterPlayerPlugin.CACHE_KEY_PARAMETER, cacheKey)
+            headers.keys.forEach { dataBuilder.putString(BetterPlayerPlugin.HEADER_PARAMETER + it, headers[it]) }
             if (dataSource != null && context != null) {
-                val cacheWorkRequest = OneTimeWorkRequest.Builder(CacheWorker::class.java)
-                    .addTag(dataSource)
-                    .setInputData(dataBuilder.build()).build()
-                WorkManager.getInstance(context).enqueue(cacheWorkRequest)
+                WorkManager.getInstance(context).enqueue(
+                    OneTimeWorkRequest.Builder(CacheWorker::class.java)
+                        .addTag(dataSource)
+                        .setInputData(dataBuilder.build())
+                        .build()
+                )
             }
             result.success(null)
         }
 
         fun stopPreCache(context: Context?, url: String?, result: MethodChannel.Result) {
-            if (url != null && context != null) {
-                WorkManager.getInstance(context).cancelAllWorkByTag(url)
-            }
+            if (url != null && context != null) WorkManager.getInstance(context).cancelAllWorkByTag(url)
             result.success(null)
         }
     }
