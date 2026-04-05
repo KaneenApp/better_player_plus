@@ -49,6 +49,7 @@ import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.dash.DashMediaSource
@@ -113,9 +114,20 @@ internal class BetterPlayer(
             this.customDefaultLoadControl.bufferForPlaybackAfterRebufferMs
         )
         loadControl = loadBuilder.build()
+        // ── NeuroMax: configure DefaultRenderersFactory ──────────────────────────────────
+        // EXTENSION_RENDERER_MODE_PREFER activates the Jellyfin FFmpeg extension
+        // for software-decoded audio formats (DTS, AC3, TrueHD, DTS-HD MA)
+        // while still preferring hardware decoders for H.264/H.265 video.
+        // setEnableDecoderFallback(true) degrades gracefully to the next
+        // available decoder instead of throwing a fatal PlaybackException.
+        val renderersFactory = DefaultRenderersFactory(context).apply {
+            setExtensionRendererMode(NeuroMaxConfig.extensionRendererMode)
+            setEnableDecoderFallback(true)
+        }
         exoPlayer = ExoPlayer.Builder(context)
             .setTrackSelector(trackSelector)
             .setLoadControl(loadControl)
+            .setRenderersFactory(renderersFactory)
             .build()
         workManager = WorkManager.getInstance(context)
         workerObserverMap = HashMap()
@@ -396,6 +408,11 @@ internal class BetterPlayer(
                 }
             }
             override fun onPlayerError(error: PlaybackException) {
+                // ── NeuroMax: forward error to native logger + Dart error stream ──────────
+                // Logs the specific error code (e.g., 2001 = BAD_HTTP_STATUS,
+                // 3001 = DECODER_INIT_FAILED) to Logcat and relays to the Dart
+                // EventChannel (com.neuromax/player_errors) via NeuroMaxConfig.errorListener.
+                NeuroMaxConfig.onPlaybackError(error)
                 eventSink.error("VideoError", "Video player had error $error", "")
             }
         })
@@ -625,7 +642,7 @@ internal class BetterPlayer(
                     }
                 }
 
-                // ── Pass 1: exact language-code match ──────────────────────────────
+                // ── Pass 1: exact language-code match ──────────────────────────────────
                 // format.language carries the BCP-47 / ISO 639 tag assigned by
                 // the container parser.  This is the most reliable field.
                 for (gi in 0 until trackGroupArray.length) {
@@ -643,7 +660,7 @@ internal class BetterPlayer(
                     }
                 }
 
-                // ── Pass 2: exact label match (case-insensitive) ───────────────────
+                // ── Pass 2: exact label match (case-insensitive) ───────────────────────
                 for (gi in 0 until trackGroupArray.length) {
                     val grp = trackGroupArray[gi]
                     for (ti in 0 until grp.length) {
@@ -658,7 +675,7 @@ internal class BetterPlayer(
                     }
                 }
 
-                // ── Pass 3: null-label group-index fallback ───────────────────────
+                // ── Pass 3: null-label group-index fallback ────────────────────────────
                 // Safe only when all tracks are unlabelled (MKV without metadata)
                 // and none have composite IDs (IPTV/HLS).
                 if (allLabelsNull && !anyCompositeId && index >= 0 && index < trackGroupArray.length) {
@@ -667,7 +684,7 @@ internal class BetterPlayer(
                     return
                 }
 
-                // ── Pass 4: label-contains substring fallback ────────────────────
+                // ── Pass 4: label-contains substring fallback ───────────────────────────
                 for (gi in 0 until trackGroupArray.length) {
                     val grp = trackGroupArray[gi]
                     for (ti in 0 until grp.length) {
