@@ -114,12 +114,6 @@ internal class BetterPlayer(
             this.customDefaultLoadControl.bufferForPlaybackAfterRebufferMs
         )
         loadControl = loadBuilder.build()
-        // ── NeuroMax: configure DefaultRenderersFactory ──────────────────────────────────
-        // EXTENSION_RENDERER_MODE_PREFER activates the Jellyfin FFmpeg extension
-        // for software-decoded audio formats (DTS, AC3, TrueHD, DTS-HD MA)
-        // while still preferring hardware decoders for H.264/H.265 video.
-        // setEnableDecoderFallback(true) degrades gracefully to the next
-        // available decoder instead of throwing a fatal PlaybackException.
         val renderersFactory = DefaultRenderersFactory(context).apply {
             setExtensionRendererMode(NeuroMaxConfig.extensionRendererMode)
             setEnableDecoderFallback(true)
@@ -353,8 +347,6 @@ internal class BetterPlayer(
         val mediaItemBuilder = MediaItem.Builder().setUri(uri)
         if (!cacheKey.isNullOrEmpty()) mediaItemBuilder.setCustomCacheKey(cacheKey)
         val mediaItem = mediaItemBuilder.build()
-        // Use explicit parameter name `mgr` to avoid Kotlin shadowing the outer
-        // DrmSessionManager with the MediaItem parameter of the SAM interface.
         val drmSessionManagerProvider: DrmSessionManagerProvider? =
             drmSessionManager?.let { mgr -> DrmSessionManagerProvider { mgr } }
 
@@ -400,6 +392,10 @@ internal class BetterPlayer(
                     Player.STATE_READY -> {
                         if (!isInitialized) { isInitialized = true; sendInitialized() }
                         eventSink.success(hashMapOf("event" to "bufferingEnd"))
+                        // Push audio tracks to NeuroMax so the Dart picker
+                        // populates even for plain MKV/MP4 IPTV streams that
+                        // return no metadata from the Xtream API.
+                        sendAudioTracksToNeuroMax()
                     }
                     Player.STATE_ENDED -> {
                         eventSink.success(hashMapOf("event" to "completed", "key" to key))
@@ -408,10 +404,6 @@ internal class BetterPlayer(
                 }
             }
             override fun onPlayerError(error: PlaybackException) {
-                // ── NeuroMax: forward error to native logger + Dart error stream ──────────
-                // Logs the specific error code (e.g., 2001 = BAD_HTTP_STATUS,
-                // 3001 = DECODER_INIT_FAILED) to Logcat and relays to the Dart
-                // EventChannel (com.neuromax/player_errors) via NeuroMaxConfig.errorListener.
                 NeuroMaxConfig.onPlaybackError(error)
                 eventSink.error("VideoError", "Video player had error $error", "")
             }
@@ -419,6 +411,57 @@ internal class BetterPlayer(
         val reply: MutableMap<String, Any> = HashMap()
         reply["textureId"] = textureEntry.id()
         result.success(reply)
+    }
+
+    /**
+     * Reads audio tracks from [trackSelector.currentMappedTrackInfo] and
+     * forwards them to [NeuroMaxConfig.tracksListener] so the Dart UI can
+     * populate the audio picker for MKV/MP4 streams.
+     *
+     * Called every time STATE_READY fires (idempotent — tracks don’t change
+     * for a given media item). The Dart side de-duplicates.
+     */
+    private fun sendAudioTracksToNeuroMax() {
+        if (NeuroMaxConfig.tracksListener == null) return
+        try {
+            val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
+            val tracks = mutableListOf<Map<String, Any>>()
+
+            for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
+                if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) continue
+
+                val groups = mappedTrackInfo.getTrackGroups(rendererIndex)
+                for (gi in 0 until groups.length) {
+                    val grp = groups[gi]
+                    // Take the first track from each group (represents the group)
+                    if (grp.length == 0) continue
+                    val fmt      = grp.getFormat(0)
+                    val rawLang  = (fmt.language ?: "").trim()
+                    val rawLabel = (fmt.label    ?: "").trim()
+                    val norm     = normLang(rawLang.ifEmpty { rawLabel })
+                    val label    = rawLabel.ifEmpty {
+                        langDisplayNames[norm]?.replaceFirstChar { it.uppercase() }
+                            ?: norm.uppercase().ifEmpty { "Track ${tracks.size + 1}" }
+                    }
+                    tracks.add(
+                        mapOf(
+                            "index"     to gi,          // group index for pass-3 fallback
+                            "language"  to norm,        // 2-letter ISO
+                            "label"     to label,       // display name
+                            "isDefault" to (gi == 0),
+                        )
+                    )
+                }
+                break // first audio renderer only
+            }
+
+            if (tracks.isNotEmpty()) {
+                Log.d(TAG, "sendAudioTracksToNeuroMax: ${tracks.size} tracks → Dart")
+                NeuroMaxConfig.onTracksReady(tracks)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "sendAudioTracksToNeuroMax failed: $e")
+        }
     }
 
     fun sendBufferingUpdate(isFromBufferingStart: Boolean) {
@@ -525,37 +568,8 @@ internal class BetterPlayer(
     }
 
     // =========================================================================
-    // Audio track selection
+    // Audio track selection (4-pass strategy)
     // =========================================================================
-    //
-    // Strategy (four passes, applied in order — first match wins):
-    //
-    //  Pass 1 — Exact language code match (format.language vs all ISO variants
-    //            of the requested lang).  Catches tracks that have a proper
-    //            BCP-47 / ISO 639 language tag but no human-readable label.
-    //
-    //  Pass 2 — Exact label match (case-insensitive) against the requested
-    //            language name, 2-letter code, or 3-letter code.
-    //            Catches tracks whose label is "Arabic", "ara", or "ar".
-    //
-    //  Pass 3 — Group-index fallback.  Used when ALL tracks in the renderer
-    //            have null labels (common in unlabelled MKV containers).
-    //            The Dart side passes the raw container index, so we honour it
-    //            directly.  The "strange track" heuristic that previously
-    //            special-cased id=="1/15" is replaced by a broader check:
-    //            if ANY track has a non-null, non-numeric, non-empty ID that
-    //            looks like an IPTV/HLS composite key, we skip this pass.
-    //
-    //  Pass 4 — Label-contains fallback.  Checks whether any track label
-    //            contains the 2-letter or 3-letter code as a substring.
-    //            Last resort before giving up.
-    //
-    // After selection, setPreferredAudioLanguage is called so ExoPlayer's
-    // adaptive logic re-selects the same language after seeks/rebuffers
-    // without needing another explicit override call from Dart.
-    //
-    // clearOverridesOfType(TRACK_TYPE_AUDIO) is called before addOverride so
-    // switching back to a previously-active track always takes effect.
 
     private val iso1to3 = mapOf(
         "en" to "eng", "ar" to "ara", "fr" to "fra", "de" to "deu",
@@ -582,27 +596,16 @@ internal class BetterPlayer(
         "he" to "hebrew",  "fa" to "persian"
     )
 
-    /** Normalise any ISO code to 2-letter lowercase, e.g. "ara" → "ar". */
     private fun normLang(raw: String): String = iso3to1[raw.lowercase().trim()] ?: raw.lowercase().trim()
 
-    /**
-     * All ISO variants of a language code, e.g. "ar" → {"ar", "ara", "arabic"}.
-     * Used for broad matching against format.language and format.label fields.
-     */
     private fun isoVariants(langCode: String): Set<String> {
         val lc    = langCode.lowercase().trim()
-        val norm1 = normLang(lc)                   // 2-letter
-        val norm3 = iso1to3[norm1] ?: norm1        // 3-letter
-        val name  = langDisplayNames[norm1] ?: ""   // display name (lowercase)
+        val norm1 = normLang(lc)
+        val norm3 = iso1to3[norm1] ?: norm1
+        val name  = langDisplayNames[norm1] ?: ""
         return setOf(lc, norm1, norm3, name).filter { it.isNotEmpty() }.toSet()
     }
 
-    /**
-     * True when a track ID looks like an IPTV/HLS composite key (e.g. "1/15",
-     * "audio:0", "stream_0") rather than a plain integer or null.  When any
-     * track has such an ID, the "null-label group-index" fallback (pass 3)
-     * is unsafe and skipped.
-     */
     private fun hasCompositeTrackIds(trackGroupArray: androidx.media3.common.TrackGroup): Boolean {
         for (i in 0 until trackGroupArray.length) {
             val id = trackGroupArray.getFormat(i).id ?: continue
@@ -617,23 +620,18 @@ internal class BetterPlayer(
                 Log.w(TAG, "setAudioTrack: no mapped track info yet")
                 return
             }
-
-            // Compute all ISO variants of the requested language once.
-            val variants = isoVariants(name)           // e.g. {"ar","ara","arabic"}
-            val norm1    = normLang(name)              // 2-letter for setPreferredAudioLanguage
-            val norm3    = iso1to3[norm1] ?: norm1     // 3-letter
-
+            val variants = isoVariants(name)
+            val norm1    = normLang(name)
+            val norm3    = iso1to3[norm1] ?: norm1
             Log.d(TAG, "setAudioTrack: name=\"$name\" index=$index variants=$variants")
 
             for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
                 if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) continue
-
                 val trackGroupArray = mappedTrackInfo.getTrackGroups(rendererIndex)
                 if (trackGroupArray.length == 0) continue
 
-                // Determine renderer-wide characteristics once.
-                var allLabelsNull      = true
-                var anyCompositeId     = false
+                var allLabelsNull  = true
+                var anyCompositeId = false
                 for (gi in 0 until trackGroupArray.length) {
                     val grp = trackGroupArray[gi]
                     if (hasCompositeTrackIds(grp)) anyCompositeId = true
@@ -642,9 +640,7 @@ internal class BetterPlayer(
                     }
                 }
 
-                // ── Pass 1: exact language-code match ──────────────────────────────────
-                // format.language carries the BCP-47 / ISO 639 tag assigned by
-                // the container parser.  This is the most reliable field.
+                // Pass 1: language-code match
                 for (gi in 0 until trackGroupArray.length) {
                     val grp = trackGroupArray[gi]
                     for (ti in 0 until grp.length) {
@@ -654,87 +650,59 @@ internal class BetterPlayer(
                         val fNorm = normLang(fLang)
                         if (fNorm == norm1 || fLang == norm3 || fLang in variants) {
                             Log.d(TAG, "setAudioTrack: pass-1 lang match fLang=\"$fLang\" gi=$gi ti=$ti")
-                            applyAudioTrackOverride(rendererIndex, gi, ti, norm1)
-                            return
+                            applyAudioTrackOverride(rendererIndex, gi, ti, norm1); return
                         }
                     }
                 }
-
-                // ── Pass 2: exact label match (case-insensitive) ───────────────────────
+                // Pass 2: exact label match
                 for (gi in 0 until trackGroupArray.length) {
                     val grp = trackGroupArray[gi]
                     for (ti in 0 until grp.length) {
-                        val fmt    = grp.getFormat(ti)
-                        val fLabel = (fmt.label ?: "").lowercase().trim()
+                        val fLabel = (grp.getFormat(ti).label ?: "").lowercase().trim()
                         if (fLabel.isEmpty()) continue
                         if (fLabel in variants) {
                             Log.d(TAG, "setAudioTrack: pass-2 label match fLabel=\"$fLabel\" gi=$gi ti=$ti")
-                            applyAudioTrackOverride(rendererIndex, gi, ti, norm1)
-                            return
+                            applyAudioTrackOverride(rendererIndex, gi, ti, norm1); return
                         }
                     }
                 }
-
-                // ── Pass 3: null-label group-index fallback ────────────────────────────
-                // Safe only when all tracks are unlabelled (MKV without metadata)
-                // and none have composite IDs (IPTV/HLS).
+                // Pass 3: null-label group-index fallback
                 if (allLabelsNull && !anyCompositeId && index >= 0 && index < trackGroupArray.length) {
                     Log.d(TAG, "setAudioTrack: pass-3 index fallback index=$index")
-                    applyAudioTrackOverride(rendererIndex, index, 0, norm1)
-                    return
+                    applyAudioTrackOverride(rendererIndex, index, 0, norm1); return
                 }
-
-                // ── Pass 4: label-contains substring fallback ───────────────────────────
+                // Pass 4: label-contains substring fallback
                 for (gi in 0 until trackGroupArray.length) {
                     val grp = trackGroupArray[gi]
                     for (ti in 0 until grp.length) {
                         val fLabel = (grp.getFormat(ti).label ?: "").lowercase()
                         if (variants.any { v -> fLabel.contains(v) }) {
                             Log.d(TAG, "setAudioTrack: pass-4 contains match fLabel=\"$fLabel\" gi=$gi ti=$ti")
-                            applyAudioTrackOverride(rendererIndex, gi, ti, norm1)
-                            return
+                            applyAudioTrackOverride(rendererIndex, gi, ti, norm1); return
                         }
                     }
                 }
-
                 Log.w(TAG, "setAudioTrack: no match found for name=\"$name\" index=$index")
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "setAudioTrack failed: $e")
-        }
+        } catch (e: Exception) { Log.e(TAG, "setAudioTrack failed: $e") }
     }
 
-    /**
-     * Apply the track selector override and set the preferred audio language
-     * so ExoPlayer's adaptive logic re-selects this language automatically
-     * after seeks and rebuffers, without needing another Dart call.
-     */
-    private fun applyAudioTrackOverride(
-        rendererIndex: Int,
-        groupIndex: Int,
-        trackIndex: Int,
-        preferredLang: String  // 2-letter ISO 639-1
-    ) {
+    private fun applyAudioTrackOverride(rendererIndex: Int, groupIndex: Int, trackIndex: Int, preferredLang: String) {
         val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
         val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
         if (groupIndex < 0 || groupIndex >= trackGroups.length) {
             Log.e(TAG, "applyAudioTrackOverride: groupIndex=$groupIndex out of bounds (len=${trackGroups.length})")
             return
         }
-        val group = trackGroups[groupIndex]
+        val group     = trackGroups[groupIndex]
         val safeTrack = trackIndex.coerceIn(0, group.length - 1)
-
-        // setPreferredAudioLanguage ensures the adaptive selector re-picks
-        // the same language after a seek or mid-stream rebuffer.  We set
-        // both ISO forms so ExoPlayer recognises either tag format.
-        val norm3 = iso1to3[preferredLang] ?: preferredLang
+        val norm3     = iso1to3[preferredLang] ?: preferredLang
         trackSelector.setParameters(
-            trackSelector.parameters
-                .buildUpon()
+            trackSelector.parameters.buildUpon()
                 .setRendererDisabled(rendererIndex, false)
                 .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
                 .addOverride(TrackSelectionOverride(group, safeTrack))
-                .setPreferredAudioLanguage(norm3)   // sticky: survives seeks/rebuffers
+                .setPreferredAudioLanguage(norm3)
                 .build()
         )
         Log.d(TAG, "applyAudioTrackOverride: renderer=$rendererIndex group=$groupIndex track=$safeTrack lang=$preferredLang/$norm3")
@@ -750,7 +718,6 @@ internal class BetterPlayer(
             for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
                 if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_TEXT) continue
                 val trackGroupArray = mappedTrackInfo.getTrackGroups(rendererIndex)
-                // Pass 1: label or language match
                 for (gi in 0 until trackGroupArray.length) {
                     val grp = trackGroupArray[gi]
                     for (ti in 0 until grp.length) {
@@ -761,7 +728,6 @@ internal class BetterPlayer(
                         }
                     }
                 }
-                // Pass 2: index fallback
                 if (index >= 0 && index < trackGroupArray.length) {
                     setSubtitleOverride(rendererIndex, index, 0); return
                 }
@@ -845,10 +811,7 @@ internal class BetterPlayer(
             try {
                 context?.let { deleteDirectory(File(it.cacheDir, "betterPlayerCache")) }
                 result.success(null)
-            } catch (e: Exception) {
-                Log.e(TAG, e.toString())
-                result.error("", "", "")
-            }
+            } catch (e: Exception) { Log.e(TAG, e.toString()); result.error("", "", "") }
         }
 
         private fun deleteDirectory(file: File) {
