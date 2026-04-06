@@ -53,6 +53,8 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.LoadControl
+import androidx.media3.exoplayer.audio.AudioCapabilities
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.dash.DefaultDashChunkSource
 import androidx.media3.exoplayer.drm.DefaultDrmSessionManager
@@ -126,10 +128,30 @@ internal class BetterPlayer(
             setExtensionRendererMode(NeuroMaxConfig.extensionRendererMode)
             setEnableDecoderFallback(true)
         }
-        exoPlayer = ExoPlayer.Builder(context)
+
+        // ── DTS / AC3 / EAC3 passthrough via HDMI sink capabilities ──────────
+        // AudioCapabilities.getCapabilities(context) queries what the connected
+        // HDMI receiver actually supports — not just what Android's software
+        // decoders can handle. This enables DTS, DTS-HD, AC3, EAC3, TrueHD
+        // passthrough to receivers/TVs that decode those formats natively.
+        // Without this, ExoPlayer defaults to AudioCapabilities.DEFAULT_AUDIO_CAPABILITIES
+        // which only allows PCM, causing DTS tracks to produce no audio on
+        // devices whose MediaCodecList reports audio/vnd.dts as "Unsupported".
+        val audioCapabilities = AudioCapabilities.getCapabilities(context)
+        val audioSink = DefaultAudioSink.Builder(context)
+            .setAudioCapabilities(audioCapabilities)
+            .setEnableFloatOutput(false)
+            .setEnableAudioTrackPlaybackParams(true)
+            .build()
+        val renderersFactoryWithPassthrough = DefaultRenderersFactory(context).apply {
+            setExtensionRendererMode(NeuroMaxConfig.extensionRendererMode)
+            setEnableDecoderFallback(true)
+        }
+
+        exoPlayer = ExoPlayer.Builder(context, renderersFactoryWithPassthrough)
             .setTrackSelector(trackSelector)
             .setLoadControl(loadControl)
-            .setRenderersFactory(renderersFactory)
+            .setAudioSink(audioSink)
             .build()
         workManager = WorkManager.getInstance(context)
         workerObserverMap = HashMap()
