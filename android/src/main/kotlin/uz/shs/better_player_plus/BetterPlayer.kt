@@ -43,6 +43,7 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.util.Util
 import androidx.media3.datasource.DataSource
@@ -105,6 +106,11 @@ internal class BetterPlayer(
         customDefaultLoadControl ?: CustomDefaultLoadControl()
     private var lastSendBufferedPosition = 0L
 
+    // Guard: send tracks only once per media item via onTracksChanged.
+    // STATE_READY may fire before currentMappedTrackInfo is populated;
+    // onTracksChanged() is the authoritative hook.
+    private var tracksSentForCurrentItem = false
+
     init {
         val loadBuilder = DefaultLoadControl.Builder()
         loadBuilder.setBufferDurationsMs(
@@ -147,6 +153,7 @@ internal class BetterPlayer(
     ) {
         this.key = key
         isInitialized = false
+        tracksSentForCurrentItem = false   // reset for new media item
         val uri = dataSource?.toUri()
         var dataSourceFactory: DataSource.Factory?
         val userAgent = getUserAgent(headers)
@@ -392,10 +399,11 @@ internal class BetterPlayer(
                     Player.STATE_READY -> {
                         if (!isInitialized) { isInitialized = true; sendInitialized() }
                         eventSink.success(hashMapOf("event" to "bufferingEnd"))
-                        // Push audio tracks to NeuroMax so the Dart picker
-                        // populates even for plain MKV/MP4 IPTV streams that
-                        // return no metadata from the Xtream API.
-                        sendAudioTracksToNeuroMax()
+                        // Early attempt: currentMappedTrackInfo may still be null
+                        // at STATE_READY on IPTV/MKV streams. This is a cheap no-op
+                        // if tracks aren't available yet — onTracksChanged() below
+                        // is the authoritative call.
+                        sendAudioTracksToNeuroMax(source = "STATE_READY")
                     }
                     Player.STATE_ENDED -> {
                         eventSink.success(hashMapOf("event" to "completed", "key" to key))
@@ -403,6 +411,19 @@ internal class BetterPlayer(
                     Player.STATE_IDLE -> { /* no-op */ }
                 }
             }
+
+            // ── KEY FIX ──────────────────────────────────────────────────────
+            // onTracksChanged() fires when ExoPlayer has actually resolved and
+            // selected track groups — currentMappedTrackInfo is guaranteed
+            // non-null with real data here. Logcat confirmed this fires ~2s
+            // after STATE_READY on IPTV/MKV streams.
+            //
+            // The tracksSentForCurrentItem guard prevents redundant sends if
+            // onTracksChanged fires multiple times (e.g. after seek, ABR switch).
+            override fun onTracksChanged(tracks: Tracks) {
+                sendAudioTracksToNeuroMax(source = "onTracksChanged")
+            }
+
             override fun onPlayerError(error: PlaybackException) {
                 NeuroMaxConfig.onPlaybackError(error)
                 eventSink.error("VideoError", "Video player had error $error", "")
@@ -418,10 +439,15 @@ internal class BetterPlayer(
      * forwards them to [NeuroMaxConfig.tracksListener] so the Dart UI can
      * populate the audio picker for MKV/MP4 streams.
      *
-     * Called every time STATE_READY fires (idempotent — tracks don’t change
-     * for a given media item). The Dart side de-duplicates.
+     * Called from two sites:
+     *   1. STATE_READY  — early attempt, may return 0 tracks (no-op)
+     *   2. onTracksChanged() — authoritative, always has tracks when non-empty
+     *
+     * The [tracksSentForCurrentItem] guard ensures we only forward the first
+     * non-empty delivery per media item. The Dart side also de-duplicates via
+     * _nativeTracksApplied, so double-delivery is harmless.
      */
-    private fun sendAudioTracksToNeuroMax() {
+    private fun sendAudioTracksToNeuroMax(source: String = "") {
         if (NeuroMaxConfig.tracksListener == null) return
         try {
             val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
@@ -433,7 +459,6 @@ internal class BetterPlayer(
                 val groups = mappedTrackInfo.getTrackGroups(rendererIndex)
                 for (gi in 0 until groups.length) {
                     val grp = groups[gi]
-                    // Take the first track from each group (represents the group)
                     if (grp.length == 0) continue
                     val fmt      = grp.getFormat(0)
                     val rawLang  = (fmt.language ?: "").trim()
@@ -445,9 +470,9 @@ internal class BetterPlayer(
                     }
                     tracks.add(
                         mapOf(
-                            "index"     to gi,          // group index for pass-3 fallback
-                            "language"  to norm,        // 2-letter ISO
-                            "label"     to label,       // display name
+                            "index"     to gi,
+                            "language"  to norm,
+                            "label"     to label,
                             "isDefault" to (gi == 0),
                         )
                     )
@@ -455,10 +480,20 @@ internal class BetterPlayer(
                 break // first audio renderer only
             }
 
-            if (tracks.isNotEmpty()) {
-                Log.d(TAG, "sendAudioTracksToNeuroMax: ${tracks.size} tracks → Dart")
-                NeuroMaxConfig.onTracksReady(tracks)
+            if (tracks.isEmpty()) {
+                Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: 0 tracks — mappedTrackInfo not ready yet")
+                return
             }
+
+            // Only send if we haven't already sent a non-empty list for this item
+            if (tracksSentForCurrentItem) {
+                Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: already sent for this item — skipping")
+                return
+            }
+            tracksSentForCurrentItem = true
+
+            Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: ${tracks.size} tracks → Dart")
+            NeuroMaxConfig.onTracksReady(tracks)
         } catch (e: Exception) {
             Log.e(TAG, "sendAudioTracksToNeuroMax failed: $e")
         }
