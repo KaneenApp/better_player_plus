@@ -106,10 +106,12 @@ internal class BetterPlayer(
         customDefaultLoadControl ?: CustomDefaultLoadControl()
     private var lastSendBufferedPosition = 0L
 
-    // Guard: send tracks only once per media item via onTracksChanged.
-    // STATE_READY may fire before currentMappedTrackInfo is populated;
-    // onTracksChanged() is the authoritative hook.
-    private var tracksSentForCurrentItem = false
+    // FIX: replaced boolean tracksSentForCurrentItem with a count.
+    // Old boolean blocked the authoritative onTracksChanged delivery whenever
+    // an earlier fire had already sent a smaller (incomplete) list.
+    // New rule: only skip if the new count is not larger than what we already sent.
+    // This lets onTracksChanged always win over a stale STATE_READY delivery.
+    private var lastSentTrackCount = 0
 
     init {
         val loadBuilder = DefaultLoadControl.Builder()
@@ -153,7 +155,7 @@ internal class BetterPlayer(
     ) {
         this.key = key
         isInitialized = false
-        tracksSentForCurrentItem = false   // reset for new media item
+        lastSentTrackCount = 0   // reset for new media item
         val uri = dataSource?.toUri()
         var dataSourceFactory: DataSource.Factory?
         val userAgent = getUserAgent(headers)
@@ -399,10 +401,8 @@ internal class BetterPlayer(
                     Player.STATE_READY -> {
                         if (!isInitialized) { isInitialized = true; sendInitialized() }
                         eventSink.success(hashMapOf("event" to "bufferingEnd"))
-                        // Early attempt: currentMappedTrackInfo may still be null
-                        // at STATE_READY on IPTV/MKV streams. This is a cheap no-op
-                        // if tracks aren't available yet — onTracksChanged() below
-                        // is the authoritative call.
+                        // Early attempt using deprecated MappedTrackInfo.
+                        // May return 0 tracks — that's fine, onTracksChanged below is authoritative.
                         sendAudioTracksToNeuroMax(source = "STATE_READY")
                     }
                     Player.STATE_ENDED -> {
@@ -412,16 +412,12 @@ internal class BetterPlayer(
                 }
             }
 
-            // ── KEY FIX ──────────────────────────────────────────────────────
-            // onTracksChanged() fires when ExoPlayer has actually resolved and
-            // selected track groups — currentMappedTrackInfo is guaranteed
-            // non-null with real data here. Logcat confirmed this fires ~2s
-            // after STATE_READY on IPTV/MKV streams.
-            //
-            // The tracksSentForCurrentItem guard prevents redundant sends if
-            // onTracksChanged fires multiple times (e.g. after seek, ABR switch).
+            // FIX: pass the Tracks object directly so we don't need currentMappedTrackInfo.
+            // onTracksChanged fires when ExoPlayer has fully resolved track groups — this is
+            // the authoritative delivery. The count-based guard allows this to replace any
+            // earlier incomplete STATE_READY delivery.
             override fun onTracksChanged(tracks: Tracks) {
-                sendAudioTracksToNeuroMax(source = "onTracksChanged")
+                sendAudioTracksToNeuroMax(source = "onTracksChanged", tracks = tracks)
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -435,65 +431,124 @@ internal class BetterPlayer(
     }
 
     /**
-     * Reads audio tracks from [trackSelector.currentMappedTrackInfo] and
-     * forwards them to [NeuroMaxConfig.tracksListener] so the Dart UI can
-     * populate the audio picker for MKV/MP4 streams.
+     * Reads ALL audio tracks from ExoPlayer and forwards them to
+     * [NeuroMaxConfig.tracksListener] so the Dart UI can populate the audio picker.
      *
-     * Called from two sites:
-     *   1. STATE_READY  — early attempt, may return 0 tracks (no-op)
-     *   2. onTracksChanged() — authoritative, always has tracks when non-empty
+     * FIX — two bugs fixed vs original:
      *
-     * The [tracksSentForCurrentItem] guard ensures we only forward the first
-     * non-empty delivery per media item. The Dart side also de-duplicates via
-     * _nativeTracksApplied, so double-delivery is harmless.
+     * 1. Boolean guard replaced with count comparison.
+     *    Old code: set tracksSentForCurrentItem=true after first non-empty send,
+     *    block everything after. This silently dropped the authoritative
+     *    onTracksChanged delivery if STATE_READY fired first with a partial list.
+     *    New code: skip only if new count <= lastSentTrackCount. Richer lists win.
+     *
+     * 2. All tracks within each TrackGroup are now enumerated.
+     *    Old code: only read grp.getFormat(0) — the first format per group.
+     *    For MKV files where ExoPlayer packs multiple audio tracks in one group,
+     *    this returned 1 track instead of N.
+     *
+     * Each track map now includes:
+     *   index             — flat sequential index
+     *   groupIndex        — TrackGroup index among audio groups
+     *   trackInGroupIndex — track index within that group
+     *   language          — normalised ISO-639-1 code
+     *   label             — human-readable name
+     *   mimeType          — e.g. "audio/ac3", "audio/mp4a-latm"
+     *   channels          — channel count (0 if unknown)
+     *   isDefault         — true for the first track
      */
-    private fun sendAudioTracksToNeuroMax(source: String = "") {
+    private fun sendAudioTracksToNeuroMax(source: String = "", tracks: Tracks? = null) {
         if (NeuroMaxConfig.tracksListener == null) return
         try {
-            val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
-            val tracks = mutableListOf<Map<String, Any>>()
+            val trackList = mutableListOf<Map<String, Any>>()
 
-            for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
-                if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) continue
-
-                val groups = mappedTrackInfo.getTrackGroups(rendererIndex)
-                for (gi in 0 until groups.length) {
-                    val grp = groups[gi]
-                    if (grp.length == 0) continue
-                    val fmt      = grp.getFormat(0)
-                    val rawLang  = (fmt.language ?: "").trim()
-                    val rawLabel = (fmt.label    ?: "").trim()
-                    val norm     = normLang(rawLang.ifEmpty { rawLabel })
-                    val label    = rawLabel.ifEmpty {
-                        langDisplayNames[norm]?.replaceFirstChar { it.uppercase() }
-                            ?: norm.uppercase().ifEmpty { "Track ${tracks.size + 1}" }
+            if (tracks != null) {
+                // ── Preferred path: use Tracks directly from onTracksChanged ──────
+                var flatIdx    = 0
+                var audioGrpIdx = 0
+                for (group in tracks.groups) {
+                    if (group.type != C.TRACK_TYPE_AUDIO) continue
+                    for (ti in 0 until group.length) {
+                        val fmt      = group.getTrackFormat(ti)
+                        val rawLang  = (fmt.language ?: "").trim()
+                        val rawLabel = (fmt.label    ?: "").trim()
+                        val mime     = fmt.sampleMimeType ?: ""
+                        val channels = fmt.channelCount.let { if (it > 0) it else 0 }
+                        val norm     = normLang(rawLang.ifEmpty { rawLabel })
+                        val label    = rawLabel.ifEmpty {
+                            langDisplayNames[norm]?.replaceFirstChar { it.uppercase() }
+                                ?: norm.uppercase().ifEmpty { "Track ${flatIdx + 1}" }
+                        }
+                        trackList.add(mapOf(
+                            "index"             to flatIdx,
+                            "groupIndex"        to audioGrpIdx,
+                            "trackInGroupIndex" to ti,
+                            "language"          to norm,
+                            "label"             to label,
+                            "mimeType"          to mime,
+                            "channels"          to channels,
+                            "isDefault"         to (flatIdx == 0),
+                        ))
+                        Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: " +
+                            "[flat=$flatIdx grp=$audioGrpIdx ti=$ti] " +
+                            "lang=$norm label=$label mime=$mime ch=$channels")
+                        flatIdx++
                     }
-                    tracks.add(
-                        mapOf(
-                            "index"     to gi,
-                            "language"  to norm,
-                            "label"     to label,
-                            "isDefault" to (gi == 0),
-                        )
-                    )
+                    audioGrpIdx++
                 }
-                break // first audio renderer only
+            } else {
+                // ── Fallback: use deprecated MappedTrackInfo (STATE_READY path) ───
+                val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
+                var flatIdx    = 0
+                for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
+                    if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) continue
+                    val groups = mappedTrackInfo.getTrackGroups(rendererIndex)
+                    for (gi in 0 until groups.length) {
+                        val grp = groups[gi]
+                        for (ti in 0 until grp.length) {
+                            val fmt      = grp.getFormat(ti)
+                            val rawLang  = (fmt.language ?: "").trim()
+                            val rawLabel = (fmt.label    ?: "").trim()
+                            val mime     = fmt.sampleMimeType ?: ""
+                            val channels = fmt.channelCount.let { if (it > 0) it else 0 }
+                            val norm     = normLang(rawLang.ifEmpty { rawLabel })
+                            val label    = rawLabel.ifEmpty {
+                                langDisplayNames[norm]?.replaceFirstChar { it.uppercase() }
+                                    ?: norm.uppercase().ifEmpty { "Track ${flatIdx + 1}" }
+                            }
+                            trackList.add(mapOf(
+                                "index"             to flatIdx,
+                                "groupIndex"        to gi,
+                                "trackInGroupIndex" to ti,
+                                "language"          to norm,
+                                "label"             to label,
+                                "mimeType"          to mime,
+                                "channels"          to channels,
+                                "isDefault"         to (flatIdx == 0),
+                            ))
+                            flatIdx++
+                        }
+                    }
+                    break // first audio renderer only
+                }
             }
 
-            if (tracks.isEmpty()) {
-                Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: 0 tracks — mappedTrackInfo not ready yet")
+            if (trackList.isEmpty()) {
+                Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: 0 tracks — not ready yet")
                 return
             }
 
-            // Only send if we haven't already sent a non-empty list for this item
-            if (tracksSentForCurrentItem) {
-                Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: already sent for this item — skipping")
+            // FIX: allow richer deliveries to update the list.
+            // Only skip if the new count is not larger than what we already sent.
+            if (trackList.size <= lastSentTrackCount) {
+                Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: " +
+                    "already sent $lastSentTrackCount tracks, new=${trackList.size} — not richer, skipping")
                 return
             }
-            tracksSentForCurrentItem = true
+            lastSentTrackCount = trackList.size
 
-            Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: ${tracks.size} tracks → Dart")
-            NeuroMaxConfig.onTracksReady(tracks)
+            Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: ${trackList.size} tracks → Dart")
+            NeuroMaxConfig.onTracksReady(trackList)
         } catch (e: Exception) {
             Log.e(TAG, "sendAudioTracksToNeuroMax failed: $e")
         }
