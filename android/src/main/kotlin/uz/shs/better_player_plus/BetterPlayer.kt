@@ -1044,5 +1044,43 @@ internal class BetterPlayer(
             if (url != null && context != null) WorkManager.getInstance(context).cancelAllWorkByTag(url)
             result.success(null)
         }
+
+        fun sparsePreCache(
+            context: Context?, dataSource: String?,
+            maxCacheSize: Long, maxCacheFileSize: Long,
+            headers: Map<String, String?>,
+            cacheKey: String?,
+            anchorCount: Int,
+            anchorSizeBytes: Long,
+            headSizeBytes: Long,
+            tailSizeBytes: Long,
+            result: MethodChannel.Result
+        ) {
+            if (dataSource != null && context != null) {
+                val nonNullHeaders = headers.filterValues { it != null }.mapValues { it.value!! }
+                SparseCacheWorker.startSparsePreCache(
+                    context,
+                    dataSource,
+                    cacheKey,
+                    nonNullHeaders,
+                    maxCacheSize,
+                    maxCacheFileSize,
+                    anchorCount,
+                    anchorSizeBytes,
+                    headSizeBytes,
+                    tailSizeBytes
+                )
+            }
+            result.success(null)
+        }
+
+        fun stopSparsePreCache(context: Context?, key: String?, result: MethodChannel.Result) {
+            if (key != null) {
+                SparseCacheWorker.stopSparsePreCache(key)
+            } else {
+                SparseCacheWorker.stopAll()
+            }
+            result.success(null)
+        }
     }
 }

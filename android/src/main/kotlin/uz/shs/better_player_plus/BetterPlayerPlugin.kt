@@ -125,6 +125,8 @@ class BetterPlayerPlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
 
             PRE_CACHE_METHOD -> preCache(call, result)
             STOP_PRE_CACHE_METHOD -> stopPreCache(call, result)
+            SPARSE_PRE_CACHE_METHOD -> sparsePreCache(call, result)
+            STOP_SPARSE_PRE_CACHE_METHOD -> stopSparsePreCache(call, result)
             CLEAR_CACHE_METHOD -> clearCache(result)
             else -> {
                 if (call.argument<Any>(TEXTURE_ID_PARAMETER) == null) {
@@ -351,6 +353,46 @@ class BetterPlayerPlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
         BetterPlayer.stopPreCache(flutterState?.applicationContext, url, result)
     }
 
+    @OptIn(UnstableApi::class)
+    private fun sparsePreCache(call: MethodCall, result: MethodChannel.Result) {
+        val dataSource = call.argument<Map<String, Any?>>(DATA_SOURCE_PARAMETER)
+        if (dataSource != null) {
+            val maxCacheSizeNumber: Number = getParameter(dataSource, MAX_CACHE_SIZE_PARAMETER, 100 * 1024 * 1024)
+            val maxCacheFileSizeNumber: Number = getParameter(dataSource, MAX_CACHE_FILE_SIZE_PARAMETER, 10 * 1024 * 1024)
+            val maxCacheSize = maxCacheSizeNumber.toLong()
+            val maxCacheFileSize = maxCacheFileSizeNumber.toLong()
+            val uri = getParameter(dataSource, URI_PARAMETER, "")
+            val cacheKey = getParameter<String?>(dataSource, CACHE_KEY_PARAMETER, null)
+            val headers: Map<String, String> = getParameter(dataSource, HEADERS_PARAMETER, HashMap())
+            val anchorCount: Number = getParameter(dataSource, ANCHOR_COUNT_PARAMETER, 18)
+            val anchorSizeBytes: Number = getParameter(dataSource, ANCHOR_SIZE_BYTES_PARAMETER, 1572864L)
+            val headSizeBytes: Number = getParameter(dataSource, HEAD_SIZE_BYTES_PARAMETER, 4194304L)
+            val tailSizeBytes: Number = getParameter(dataSource, TAIL_SIZE_BYTES_PARAMETER, 2097152L)
+
+            BetterPlayer.sparsePreCache(
+                flutterState?.applicationContext,
+                uri,
+                maxCacheSize,
+                maxCacheFileSize,
+                headers,
+                cacheKey,
+                anchorCount.toInt(),
+                anchorSizeBytes.toLong(),
+                headSizeBytes.toLong(),
+                tailSizeBytes.toLong(),
+                result
+            )
+        } else {
+            result.success(null)
+        }
+    }
+
+    @UnstableApi
+    private fun stopSparsePreCache(call: MethodCall, result: MethodChannel.Result) {
+        val key = call.argument<String?>(CACHE_KEY_PARAMETER) ?: call.argument<String?>(URL_PARAMETER)
+        BetterPlayer.stopSparsePreCache(flutterState?.applicationContext, key, result)
+    }
+
     @UnstableApi
     private fun clearCache(result: MethodChannel.Result) {
         BetterPlayer.clearCache(flutterState?.applicationContext, result)
@@ -561,5 +603,11 @@ class BetterPlayerPlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
         private const val DISPOSE_METHOD = "dispose"
         private const val PRE_CACHE_METHOD = "preCache"
         private const val STOP_PRE_CACHE_METHOD = "stopPreCache"
+        private const val SPARSE_PRE_CACHE_METHOD = "sparsePreCache"
+        private const val STOP_SPARSE_PRE_CACHE_METHOD = "stopSparsePreCache"
+        const val ANCHOR_COUNT_PARAMETER = "anchorCount"
+        const val ANCHOR_SIZE_BYTES_PARAMETER = "anchorSizeBytes"
+        const val HEAD_SIZE_BYTES_PARAMETER = "headSizeBytes"
+        const val TAIL_SIZE_BYTES_PARAMETER = "tailSizeBytes"
     }
 }

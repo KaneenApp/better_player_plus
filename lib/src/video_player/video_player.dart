@@ -612,6 +612,24 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
 
   static Future<void> stopPreCache(String url, String? cacheKey) async =>
       _videoPlayerPlatform.stopPreCache(url, cacheKey);
+
+  static Future<void> sparsePreCache(
+    DataSource dataSource, {
+    int anchorCount = 18,
+    int anchorSizeBytes = 1572864,
+    int headSizeBytes = 4194304,
+    int tailSizeBytes = 2097152,
+  }) async =>
+      _videoPlayerPlatform.sparsePreCache(
+        dataSource,
+        anchorCount: anchorCount,
+        anchorSizeBytes: anchorSizeBytes,
+        headSizeBytes: headSizeBytes,
+        tailSizeBytes: tailSizeBytes,
+      );
+
+  static Future<void> stopSparsePreCache(String url, String? cacheKey) async =>
+      _videoPlayerPlatform.stopSparsePreCache(url, cacheKey);
 }
 
 /// Widget that displays the video controlled by [controller].

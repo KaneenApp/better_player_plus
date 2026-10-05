@@ -212,6 +212,37 @@ class MethodChannelVideoPlayer extends VideoPlayerPlatform {
       _channel.invokeMethod<void>('stopPreCache', <String, dynamic>{'url': url, 'cacheKey': cacheKey});
 
   @override
+  Future<void> sparsePreCache(
+    DataSource dataSource, {
+    int anchorCount = 18,
+    int anchorSizeBytes = 1572864,
+    int headSizeBytes = 4194304,
+    int tailSizeBytes = 2097152,
+  }) {
+    final Map<String, dynamic> dataSourceDescription = <String, dynamic>{
+      'key': dataSource.key,
+      'uri': dataSource.uri,
+      'certificateUrl': dataSource.certificateUrl,
+      'headers': dataSource.headers,
+      'maxCacheSize': dataSource.maxCacheSize,
+      'maxCacheFileSize': dataSource.maxCacheFileSize,
+      'cacheKey': dataSource.cacheKey,
+      'videoExtension': dataSource.videoExtension,
+      'anchorCount': anchorCount,
+      'anchorSizeBytes': anchorSizeBytes,
+      'headSizeBytes': headSizeBytes,
+      'tailSizeBytes': tailSizeBytes,
+    };
+    return _channel.invokeMethod<void>(
+        'sparsePreCache', <String, dynamic>{'dataSource': dataSourceDescription});
+  }
+
+  @override
+  Future<void> stopSparsePreCache(String url, String? cacheKey) =>
+      _channel.invokeMethod<void>('stopSparsePreCache',
+          <String, dynamic>{'url': url, 'cacheKey': cacheKey});
+
+  @override
   Stream<VideoEvent> videoEventsFor(int? textureId) =>
       _eventChannelFor(textureId).receiveBroadcastStream().map((event) {
         late Map<dynamic, dynamic> map;

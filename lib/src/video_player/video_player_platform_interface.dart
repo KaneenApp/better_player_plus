@@ -80,6 +80,22 @@ abstract class VideoPlayerPlatform {
     throw UnimplementedError('stopPreCache() has not been implemented.');
   }
 
+  /// Sparse pre-caches keyframe anchor segments across the video timeline.
+  Future<void> sparsePreCache(
+    DataSource dataSource, {
+    int anchorCount = 18,
+    int anchorSizeBytes = 1572864,
+    int headSizeBytes = 4194304,
+    int tailSizeBytes = 2097152,
+  }) {
+    throw UnimplementedError('sparsePreCache() has not been implemented.');
+  }
+
+  /// Cancels an ongoing sparse pre-cache job.
+  Future<void> stopSparsePreCache(String url, String? cacheKey) {
+    throw UnimplementedError('stopSparsePreCache() has not been implemented.');
+  }
+
   /// Set data source of video.
   Future<void> setDataSource(int? textureId, DataSource dataSource) {
     throw UnimplementedError('setDataSource() has not been implemented.');

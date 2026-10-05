@@ -1196,6 +1196,76 @@ class BetterPlayerController {
   Future<void> stopPreCache(BetterPlayerDataSource betterPlayerDataSource) async =>
       VideoPlayerController.stopPreCache(betterPlayerDataSource.url, betterPlayerDataSource.cacheConfiguration?.key);
 
+  /// Sparse pre-cache keyframe anchors across the timeline for fast skipping.
+  Future<void> sparsePreCache(
+    BetterPlayerDataSource betterPlayerDataSource, {
+    int anchorCount = 18,
+    int anchorSizeBytes = 1572864,
+    int headSizeBytes = 4194304,
+    int tailSizeBytes = 2097152,
+  }) async {
+    final cacheConfig =
+        betterPlayerDataSource.cacheConfiguration ?? const BetterPlayerCacheConfiguration(useCache: true);
+
+    final dataSource = DataSource(
+      sourceType: DataSourceType.network,
+      uri: betterPlayerDataSource.url,
+      useCache: true,
+      headers: betterPlayerDataSource.headers,
+      maxCacheSize: cacheConfig.maxCacheSize,
+      maxCacheFileSize: cacheConfig.maxCacheFileSize,
+      cacheKey: cacheConfig.key,
+      videoExtension: betterPlayerDataSource.videoExtension,
+    );
+
+    return VideoPlayerController.sparsePreCache(
+      dataSource,
+      anchorCount: anchorCount,
+      anchorSizeBytes: anchorSizeBytes,
+      headSizeBytes: headSizeBytes,
+      tailSizeBytes: tailSizeBytes,
+    );
+  }
+
+  /// Stop sparse pre cache for given [betterPlayerDataSource].
+  Future<void> stopSparsePreCache(BetterPlayerDataSource betterPlayerDataSource) async =>
+      VideoPlayerController.stopSparsePreCache(betterPlayerDataSource.url, betterPlayerDataSource.cacheConfiguration?.key);
+
+  /// Static helper to sparse pre-cache without an active controller instance
+  static Future<void> sparsePreCacheStatic(
+    BetterPlayerDataSource betterPlayerDataSource, {
+    int anchorCount = 18,
+    int anchorSizeBytes = 1572864,
+    int headSizeBytes = 4194304,
+    int tailSizeBytes = 2097152,
+  }) async {
+    final cacheConfig =
+        betterPlayerDataSource.cacheConfiguration ?? const BetterPlayerCacheConfiguration(useCache: true);
+
+    final dataSource = DataSource(
+      sourceType: DataSourceType.network,
+      uri: betterPlayerDataSource.url,
+      useCache: true,
+      headers: betterPlayerDataSource.headers,
+      maxCacheSize: cacheConfig.maxCacheSize,
+      maxCacheFileSize: cacheConfig.maxCacheFileSize,
+      cacheKey: cacheConfig.key,
+      videoExtension: betterPlayerDataSource.videoExtension,
+    );
+
+    return VideoPlayerController.sparsePreCache(
+      dataSource,
+      anchorCount: anchorCount,
+      anchorSizeBytes: anchorSizeBytes,
+      headSizeBytes: headSizeBytes,
+      tailSizeBytes: tailSizeBytes,
+    );
+  }
+
+  /// Static helper to cancel sparse pre-cache
+  static Future<void> stopSparsePreCacheStatic(String url, String? cacheKey) async =>
+      VideoPlayerController.stopSparsePreCache(url, cacheKey);
+
   /// Sets the new [betterPlayerControlsConfiguration] instance in the
   /// controller.
   void setBetterPlayerControlsConfiguration(BetterPlayerControlsConfiguration betterPlayerControlsConfiguration) {
