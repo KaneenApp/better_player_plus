@@ -153,6 +153,10 @@ abstract class VideoPlayerPlatform {
     throw UnimplementedError('setAudio() has not been implemented.');
   }
 
+  Future<void> setSubtitleTrack(int? textureId, String? name, int? index) {
+    throw UnimplementedError('setSubtitleTrack() has not been implemented.');
+  }
+
   Future<void> setMixWithOthers(int? textureId, bool mixWithOthers) {
     throw UnimplementedError('setMixWithOthers() has not been implemented.');
   }

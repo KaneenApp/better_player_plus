@@ -14,7 +14,7 @@ import androidx.media3.exoplayer.DefaultRenderersFactory
  * The host app writes to this object exactly once at startup
  * (before any [BetterPlayer] instance is created):
  *
- *   NeuroMaxConfig.extensionRendererMode = DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
+ *   NeuroMaxConfig.extensionRendererMode = DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON
  *   NeuroMaxConfig.userAgent             = "Mozilla/5.0 ..."
  *   NeuroMaxConfig.errorListener         = { code, msg, cause -> ... }
  *   NeuroMaxConfig.tracksListener        = { tracks -> ... }
@@ -32,7 +32,7 @@ object NeuroMaxConfig {
 
     // ── ExoPlayer renderer mode ─────────────────────────────────────────────────
     @JvmField var extensionRendererMode: Int =
-        DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
+        DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON
 
     // ── HTTP data source config ────────────────────────────────────────────────
     @JvmField var userAgent: String =
@@ -48,9 +48,11 @@ object NeuroMaxConfig {
     // ── Track relay ─────────────────────────────────────────────────────────────
     // Set by the app to forward ExoPlayer audio track info to Dart
     // (com.neuromax/player_tracks EventChannel) when STATE_READY fires.
-    // Each map contains: index (Int), language (String), label (String),
-    // isDefault (Boolean).
     @JvmField var tracksListener: ((List<Map<String, Any>>) -> Unit)? = null
+
+    // Set by the app to forward ExoPlayer internal subtitle tracks to Dart
+    // (com.neuromax/player_subtitles EventChannel) when STATE_READY fires.
+    @JvmField var subtitlesListener: ((List<Map<String, Any>>) -> Unit)? = null
 
     @JvmStatic
     fun onPlaybackError(error: PlaybackException) {
@@ -66,13 +68,21 @@ object NeuroMaxConfig {
 
     /**
      * Called from [BetterPlayer.sendAudioTracksToNeuroMax] when STATE_READY fires.
-     * Forwards the track list to the app's [tracksListener] so the Dart UI can
-     * populate the audio picker even for plain MKV/MP4 streams that return no
-     * track metadata from the Xtream API.
+     * Forwards the track list to the app's [tracksListener].
      */
     @JvmStatic
     fun onTracksReady(tracks: List<Map<String, Any>>) {
         if (tracks.isEmpty()) return
         tracksListener?.invoke(tracks)
+    }
+
+    /**
+     * Called from [BetterPlayer.sendSubtitleTracksToNeuroMax] when STATE_READY fires.
+     * Forwards the track list to the app's [subtitlesListener].
+     */
+    @JvmStatic
+    fun onSubtitlesReady(tracks: List<Map<String, Any>>) {
+        if (tracks.isEmpty()) return
+        subtitlesListener?.invoke(tracks)
     }
 }

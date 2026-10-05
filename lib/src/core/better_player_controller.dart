@@ -1134,6 +1134,14 @@ class BetterPlayerController {
     videoPlayerController!.setAudioTrack(audioTrack.label, audioTrack.id);
   }
 
+  ///Set subtitle track in player.
+  void setSubtitleTrack(String name, int index) {
+    if (videoPlayerController == null) {
+      throw StateError('The data source has not been initialized');
+    }
+    videoPlayerController!.setSubtitleTrack(name, index);
+  }
+
   ///Enable or disable audio mixing with other sound within device.
   void setMixWithOthers(bool mixWithOthers) {
     if (videoPlayerController == null) {

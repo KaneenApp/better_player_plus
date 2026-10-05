@@ -453,6 +453,18 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
       });
     } else {
       await _videoPlayerPlatform.pause(_textureId);
+      // Keep polling position and buffering updates while paused so the player loads ahead like YouTube
+      _timer = Timer.periodic(const Duration(milliseconds: 600), (Timer timer) async {
+        if (_isDisposed) {
+          timer.cancel();
+          return;
+        }
+        final Duration? newPosition = await position;
+        if (_isDisposed) {
+          return;
+        }
+        _updatePosition(newPosition);
+      });
     }
   }
 
@@ -583,6 +595,10 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
 
   void setAudioTrack(String? name, int? index) {
     _videoPlayerPlatform.setAudioTrack(_textureId, name, index);
+  }
+
+  void setSubtitleTrack(String? name, int? index) {
+    _videoPlayerPlatform.setSubtitleTrack(_textureId, name, index);
   }
 
   void setMixWithOthers(bool mixWithOthers) {

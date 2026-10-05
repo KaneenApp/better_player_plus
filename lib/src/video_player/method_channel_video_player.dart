@@ -177,6 +177,12 @@ class MethodChannelVideoPlayer extends VideoPlayerPlatform {
   );
 
   @override
+  Future<void> setSubtitleTrack(int? textureId, String? name, int? index) => _channel.invokeMethod<void>(
+    'setSubtitleTrack',
+    <String, dynamic>{'textureId': textureId, 'name': name, 'index': index},
+  );
+
+  @override
   Future<void> setMixWithOthers(int? textureId, bool mixWithOthers) => _channel.invokeMethod<void>(
     'setMixWithOthers',
     <String, dynamic>{'textureId': textureId, 'mixWithOthers': mixWithOthers},

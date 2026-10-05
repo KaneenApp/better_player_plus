@@ -51,6 +51,9 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.audio.AudioCapabilities
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.audio.AudioCapabilities
@@ -123,6 +126,9 @@ internal class BetterPlayer(
             this.customDefaultLoadControl.bufferForPlaybackMs,
             this.customDefaultLoadControl.bufferForPlaybackAfterRebufferMs
         )
+                loadBuilder.setPrioritizeTimeOverSizeThresholds(true)
+        loadBuilder.setTargetBufferBytes(128 * 1024 * 1024)
+        loadBuilder.setBackBuffer(30000, false)
         loadControl = loadBuilder.build()
         val renderersFactory = DefaultRenderersFactory(context).apply {
             setExtensionRendererMode(NeuroMaxConfig.extensionRendererMode)
@@ -412,7 +418,7 @@ internal class BetterPlayer(
         })
         surface = Surface(textureEntry.surfaceTexture())
         exoPlayer?.setVideoSurface(surface)
-        setAudioAttributes(exoPlayer, true)
+        setAudioAttributes(exoPlayer, false)
         exoPlayer?.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 when (playbackState) {
@@ -440,6 +446,7 @@ internal class BetterPlayer(
             // earlier incomplete STATE_READY delivery.
             override fun onTracksChanged(tracks: Tracks) {
                 sendAudioTracksToNeuroMax(source = "onTracksChanged", tracks = tracks)
+                sendSubtitleTracksToNeuroMax(source = "onTracksChanged")
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -571,8 +578,59 @@ internal class BetterPlayer(
 
             Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: ${trackList.size} tracks → Dart")
             NeuroMaxConfig.onTracksReady(trackList)
+            if (tracks.isEmpty()) {
+                Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: 0 tracks \u2014 mappedTrackInfo not ready yet")
+                return
+            }
+
+            Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: ${tracks.size} tracks \u2192 Dart")
+            NeuroMaxConfig.onTracksReady(tracks)
         } catch (e: Exception) {
             Log.e(TAG, "sendAudioTracksToNeuroMax failed: $e")
+        }
+    }
+
+    /**
+     * Reads embedded subtitle (TEXT) tracks from ExoPlayer and forwards them to Dart.
+     */
+    private fun sendSubtitleTracksToNeuroMax(source: String = "") {
+        if (NeuroMaxConfig.subtitlesListener == null) return
+        try {
+            val mappedTrackInfo = trackSelector.currentMappedTrackInfo ?: return
+            val tracks = mutableListOf<Map<String, Any>>()
+
+            for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
+                if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_TEXT) continue
+
+                val groups = mappedTrackInfo.getTrackGroups(rendererIndex)
+                for (gi in 0 until groups.length) {
+                    val grp = groups[gi]
+                    if (grp.length == 0) continue
+                    val fmt      = grp.getFormat(0)
+                    val rawLang  = (fmt.language ?: "").trim()
+                    val rawLabel = (fmt.label    ?: "").trim()
+                    val norm     = normLang(rawLang.ifEmpty { rawLabel })
+                    val label    = rawLabel.ifEmpty {
+                      langDisplayNames[norm]?.replaceFirstChar { it.uppercase() }
+                        ?: norm.uppercase().ifEmpty { "Subtitle ${tracks.size + 1}" }
+                    }
+
+                    tracks.add(
+                        mapOf(
+                            "index"    to gi,
+                            "language" to norm,
+                            "label"    to label,
+                            "source"   to "embedded"
+                        )
+                    )
+                }
+            }
+
+            if (tracks.isEmpty()) return
+            Log.d(TAG, "sendSubtitleTracksToNeuroMax[$source]: ${tracks.size} tracks \u2192 Dart")
+            NeuroMaxConfig.onSubtitlesReady(tracks)
+        } catch (e: Exception) {
+            Log.e(TAG, "sendSubtitleTracksToNeuroMax failed: $e")
         }
     }
 
@@ -712,7 +770,8 @@ internal class BetterPlayer(
 
     private fun isoVariants(langCode: String): Set<String> {
         val lc    = langCode.lowercase().trim()
-        val norm1 = normLang(lc)
+        val displayMatch = langDisplayNames.entries.firstOrNull { it.value == lc }?.key
+        val norm1 = displayMatch ?: normLang(lc)
         val norm3 = iso1to3[norm1] ?: norm1
         val name  = langDisplayNames[norm1] ?: ""
         return setOf(lc, norm1, norm3, name).filter { it.isNotEmpty() }.toSet()
@@ -732,10 +791,20 @@ internal class BetterPlayer(
                 Log.w(TAG, "setAudioTrack: no mapped track info yet")
                 return
             }
-            val variants = isoVariants(name)
-            val norm1    = normLang(name)
+            
+            var searchName = name.trim()
+            var subLabel = ""
+            if (searchName.contains('(') && searchName.endsWith(')')) {
+                val idx = searchName.indexOf('(')
+                subLabel = searchName.substring(idx + 1, searchName.length - 1).trim()
+                searchName = searchName.substring(0, idx).trim()
+            }
+            
+            val variants = isoVariants(searchName)
+            val displayMatch = langDisplayNames.entries.firstOrNull { it.value == searchName.lowercase().trim() }?.key
+            val norm1    = displayMatch ?: normLang(searchName)
             val norm3    = iso1to3[norm1] ?: norm1
-            Log.d(TAG, "setAudioTrack: name=\"$name\" index=$index variants=$variants")
+            Log.d(TAG, "setAudioTrack: name=\"$name\" parsed searchName=\"$searchName\" subLabel=\"$subLabel\" index=$index variants=$variants")
 
             for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
                 if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_AUDIO) continue
@@ -752,44 +821,65 @@ internal class BetterPlayer(
                     }
                 }
 
-                // Pass 1: language-code match
+                // Pass 1: exact language AND exact label match (if subLabel is present)
                 for (gi in 0 until trackGroupArray.length) {
                     val grp = trackGroupArray[gi]
                     for (ti in 0 until grp.length) {
                         val fmt   = grp.getFormat(ti)
                         val fLang = (fmt.language ?: "").lowercase().trim()
-                        if (fLang.isEmpty()) continue
                         val fNorm = normLang(fLang)
-                        if (fNorm == norm1 || fLang == norm3 || fLang in variants) {
-                            Log.d(TAG, "setAudioTrack: pass-1 lang match fLang=\"$fLang\" gi=$gi ti=$ti")
+                        val fLabel = (fmt.label ?: "").lowercase().trim()
+                        
+                        val langMatches = fNorm == norm1 || fLang == norm3 || fLang in variants
+                        val labelMatches = subLabel.isEmpty() || fLabel.equals(subLabel, ignoreCase = true)
+                        
+                        if (langMatches && labelMatches) {
+                            Log.d(TAG, "setAudioTrack: pass-1 exact match fLang=\"$fLang\" fLabel=\"$fLabel\" gi=$gi ti=$ti")
                             applyAudioTrackOverride(rendererIndex, gi, ti, norm1); return
                         }
                     }
                 }
-                // Pass 2: exact label match
+
+                // Pass 2: exact language match only (fall back if label doesn't match perfectly)
+                for (gi in 0 until trackGroupArray.length) {
+                    val grp = trackGroupArray[gi]
+                    for (ti in 0 until grp.length) {
+                        val fmt   = grp.getFormat(ti)
+                        val fLang = (fmt.language ?: "").lowercase().trim()
+                        val fNorm = normLang(fLang)
+                        if (fNorm == norm1 || fLang == norm3 || fLang in variants) {
+                            Log.d(TAG, "setAudioTrack: pass-2 lang-only match fLang=\"$fLang\" gi=$gi ti=$ti")
+                            applyAudioTrackOverride(rendererIndex, gi, ti, norm1); return
+                        }
+                    }
+                }
+
+                // Pass 3: exact label match (label matches either variants or the full name)
                 for (gi in 0 until trackGroupArray.length) {
                     val grp = trackGroupArray[gi]
                     for (ti in 0 until grp.length) {
                         val fLabel = (grp.getFormat(ti).label ?: "").lowercase().trim()
                         if (fLabel.isEmpty()) continue
-                        if (fLabel in variants) {
-                            Log.d(TAG, "setAudioTrack: pass-2 label match fLabel=\"$fLabel\" gi=$gi ti=$ti")
+                        if (fLabel in variants || fLabel.equals(name.trim(), ignoreCase = true)) {
+                            Log.d(TAG, "setAudioTrack: pass-3 label match fLabel=\"$fLabel\" gi=$gi ti=$ti")
                             applyAudioTrackOverride(rendererIndex, gi, ti, norm1); return
                         }
                     }
                 }
-                // Pass 3: null-label group-index fallback
+
+                // Pass 4: null-label group-index fallback
                 if (allLabelsNull && !anyCompositeId && index >= 0 && index < trackGroupArray.length) {
-                    Log.d(TAG, "setAudioTrack: pass-3 index fallback index=$index")
+                    Log.d(TAG, "setAudioTrack: pass-4 index fallback index=$index")
                     applyAudioTrackOverride(rendererIndex, index, 0, norm1); return
                 }
-                // Pass 4: label-contains substring fallback
+
+                // Pass 5: label-contains substring fallback
                 for (gi in 0 until trackGroupArray.length) {
                     val grp = trackGroupArray[gi]
                     for (ti in 0 until grp.length) {
                         val fLabel = (grp.getFormat(ti).label ?: "").lowercase()
-                        if (variants.any { v -> fLabel.contains(v) }) {
-                            Log.d(TAG, "setAudioTrack: pass-4 contains match fLabel=\"$fLabel\" gi=$gi ti=$ti")
+                        if (variants.any { v -> fLabel.contains(v) } || fLabel.contains(searchName.lowercase())) {
+                            Log.d(TAG, "setAudioTrack: pass-5 contains match fLabel=\"$fLabel\" gi=$gi ti=$ti")
                             applyAudioTrackOverride(rendererIndex, gi, ti, norm1); return
                         }
                     }
