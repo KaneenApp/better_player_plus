@@ -56,8 +56,6 @@ import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.LoadControl
-import androidx.media3.exoplayer.audio.AudioCapabilities
-import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.dash.DefaultDashChunkSource
 import androidx.media3.exoplayer.drm.DefaultDrmSessionManager
@@ -127,8 +125,8 @@ internal class BetterPlayer(
             this.customDefaultLoadControl.bufferForPlaybackAfterRebufferMs
         )
                 loadBuilder.setPrioritizeTimeOverSizeThresholds(true)
-        loadBuilder.setTargetBufferBytes(128 * 1024 * 1024)
-        loadBuilder.setBackBuffer(30000, false)
+        loadBuilder.setTargetBufferBytes(256 * 1024 * 1024)
+        loadBuilder.setBackBuffer(45000, false)
         loadControl = loadBuilder.build()
         val renderersFactory = DefaultRenderersFactory(context).apply {
             setExtensionRendererMode(NeuroMaxConfig.extensionRendererMode)
@@ -149,7 +147,13 @@ internal class BetterPlayer(
             .setEnableFloatOutput(false)
             .setEnableAudioTrackPlaybackParams(true)
             .build()
-        val renderersFactoryWithPassthrough = DefaultRenderersFactory(context).apply {
+        val renderersFactoryWithPassthrough = object : DefaultRenderersFactory(context) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean
+            ): AudioSink = audioSink
+        }.apply {
             setExtensionRendererMode(NeuroMaxConfig.extensionRendererMode)
             setEnableDecoderFallback(true)
         }
@@ -157,7 +161,6 @@ internal class BetterPlayer(
         exoPlayer = ExoPlayer.Builder(context, renderersFactoryWithPassthrough)
             .setTrackSelector(trackSelector)
             .setLoadControl(loadControl)
-            .setAudioSink(audioSink)
             .build()
         workManager = WorkManager.getInstance(context)
         workerObserverMap = HashMap()
@@ -578,13 +581,6 @@ internal class BetterPlayer(
 
             Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: ${trackList.size} tracks → Dart")
             NeuroMaxConfig.onTracksReady(trackList)
-            if (tracks.isEmpty()) {
-                Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: 0 tracks \u2014 mappedTrackInfo not ready yet")
-                return
-            }
-
-            Log.d(TAG, "sendAudioTracksToNeuroMax[$source]: ${tracks.size} tracks \u2192 Dart")
-            NeuroMaxConfig.onTracksReady(tracks)
         } catch (e: Exception) {
             Log.e(TAG, "sendAudioTracksToNeuroMax failed: $e")
         }
